@@ -8,7 +8,7 @@ edition = "2021"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -27,6 +27,8 @@ windows = { version = "0.58", features = [
   "Win32_Graphics_Printing",
   "Win32_Foundation",
   "Win32_System_Threading",
+  "Win32_Graphics_Gdi",   # OpenPrinterW y PRINTER_INFO_2W están detrás de este feature
+  "Win32_Security",       # PRINTER_INFO_2W también lo exige
 ] }
 
 [[bin]]

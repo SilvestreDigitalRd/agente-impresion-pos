@@ -93,6 +93,7 @@ fn main() {
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .tooltip("Agente de Impresión Facturación")
                 .on_menu_event(|app, event| match event.id.as_ref() {
