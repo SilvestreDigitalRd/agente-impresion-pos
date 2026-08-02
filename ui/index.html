@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8" />
+<title>Agente de Impresión</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <h1>Agente de Impresión — Facturación</h1>
+  <p class="muted">Deja esta aplicación corriendo en segundo plano (icono en la bandeja del sistema). No cierra el proceso al presionar la X — solo oculta esta ventana.</p>
+
+  <section class="card">
+    <h2>Clave de emparejamiento</h2>
+    <p class="muted">Copia esta clave UNA VEZ dentro del sistema de facturación, en <b>Configuración → Agente local</b>. Nadie más puede mandar a imprimir sin ella.</p>
+    <div class="row">
+      <input id="token" readonly />
+      <button id="copyToken">Copiar</button>
+      <button id="regenToken" class="danger">Generar nueva</button>
+    </div>
+    <p id="tokenMsg" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <h2>Origen permitido</h2>
+    <p class="muted">Solo peticiones desde esta URL exacta serán aceptadas.</p>
+    <input id="origin" placeholder="https://tu-negocio.vercel.app" />
+  </section>
+
+  <section class="card">
+    <h2>Impresora</h2>
+    <select id="printerSelect"></select>
+    <button id="refreshPrinters">Actualizar lista</button>
+  </section>
+
+  <section class="card">
+    <label class="row">
+      <input type="checkbox" id="autostart" />
+      Iniciar automáticamente con Windows
+    </label>
+  </section>
+
+  <button id="save" class="primary">Guardar</button>
+  <p id="saveMsg" class="muted"></p>
+
+  <script src="app.js"></script>
+</body>
+</html>
