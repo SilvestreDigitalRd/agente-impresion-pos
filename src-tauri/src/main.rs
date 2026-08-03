@@ -92,10 +92,22 @@ fn main() {
             let quit_i = MenuItem::with_id(app, "quit", "Salir", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
 
-            let _tray = TrayIconBuilder::new()
-                .icon(app.default_window_icon().unwrap().clone())
+            // Cargamos el ícono directo desde los bytes del archivo (no
+            // dependemos de app.default_window_icon(), que puede devolver
+            // None si el empaquetado de íconos falla por cualquier motivo).
+            // Si ni así carga, seguimos sin ícono en vez de morir en
+            // silencio — más vale una bandeja sin dibujo que un programa
+            // que no arranca y no dice por qué.
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png")).ok();
+
+            let mut tray_builder = TrayIconBuilder::new()
                 .menu(&menu)
-                .tooltip("Agente de Impresión Facturación")
+                .tooltip("Agente de Impresión Facturación");
+            if let Some(icon) = tray_icon {
+                tray_builder = tray_builder.icon(icon);
+            }
+
+            let _tray = tray_builder
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => {
                         if let Some(w) = app.get_webview_window("settings") {
