@@ -11,10 +11,11 @@
 #[cfg(target_os = "windows")]
 mod win {
     use windows::core::{PCWSTR, PWSTR};
+    use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Graphics::Printing::{
         ClosePrinter, EndDocPrinter, EndPagePrinter, EnumPrintersW, GetDefaultPrinterW,
         OpenPrinterW, StartDocPrinterW, StartPagePrinter, WritePrinter, DOC_INFO_1W,
-        PRINTER_ENUM_LOCAL, PRINTER_HANDLE, PRINTER_INFO_2W,
+        PRINTER_ENUM_LOCAL, PRINTER_INFO_2W,
     };
 
     /// Normaliza el resultado de una llamada Win32 que puede volver como
@@ -109,7 +110,7 @@ mod win {
     pub fn print_raw(printer_name: &str, data: &[u8]) -> Result<(), String> {
         unsafe {
             let wide_name = to_wide(printer_name);
-            let mut handle = PRINTER_HANDLE::default();
+            let mut handle = HANDLE::default();
             OpenPrinterW(PCWSTR(wide_name.as_ptr()), &mut handle, None)
                 .map_err(|e| format!("No se pudo abrir la impresora '{printer_name}': {e}"))?;
 
