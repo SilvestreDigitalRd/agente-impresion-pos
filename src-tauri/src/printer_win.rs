@@ -198,16 +198,21 @@ mod win {
     /// el diseño del navegador, pero confiable.
     pub fn print_a4_document(printer_name: &str, paper_size: &str, invoice: &InvoiceDoc) -> Result<(), String> {
         use windows::Win32::Graphics::Gdi::{
-            CreateDCW, DeleteDC, EndDoc, EndPage, LineTo, MoveToEx, StartDocW, StartPage,
-            TextOutW, GetDeviceCaps, DOCINFOW,
+            CreateDCW, DeleteDC, LineTo, MoveToEx, TextOutW, GetDeviceCaps, GET_DEVICE_CAPS_INDEX,
         };
+        // StartDocW/EndDoc/StartPage/EndPage/DOCINFOW viven en Storage::Xps
+        // en esta versión del crate, no en Graphics::Gdi (confirmado por el
+        // propio compilador — no es un error de shell/inyección, es solo
+        // dónde windows-rs decidió categorizar estas funciones).
+        use windows::Win32::Storage::Xps::{DOCINFOW, EndDoc, EndPage, StartDocW, StartPage};
 
         // Índices de GetDeviceCaps — constantes de wingdi.h, estables desde
         // Windows 3.1 (HORZRES=8, VERTRES=10, LOGPIXELSX=88, LOGPIXELSY=90).
-        const HORZRES: i32 = 8;
-        const VERTRES: i32 = 10;
-        const LOGPIXELSX: i32 = 88;
-        const LOGPIXELSY: i32 = 90;
+        // Esta versión exige el newtype GET_DEVICE_CAPS_INDEX, no un i32 crudo.
+        const HORZRES: GET_DEVICE_CAPS_INDEX = GET_DEVICE_CAPS_INDEX(8);
+        const VERTRES: GET_DEVICE_CAPS_INDEX = GET_DEVICE_CAPS_INDEX(10);
+        const LOGPIXELSX: GET_DEVICE_CAPS_INDEX = GET_DEVICE_CAPS_INDEX(88);
+        const LOGPIXELSY: GET_DEVICE_CAPS_INDEX = GET_DEVICE_CAPS_INDEX(90);
 
         fn to_wide(s: &str) -> Vec<u16> {
             s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -223,10 +228,10 @@ mod win {
                 return Err(format!("No se pudo crear el contexto de impresión para '{printer_name}'."));
             }
 
-            let px_x = GetDeviceCaps(Some(hdc), LOGPIXELSX) as f64 / 25.4; // píxeles por mm (horizontal)
-            let px_y = GetDeviceCaps(Some(hdc), LOGPIXELSY) as f64 / 25.4; // píxeles por mm (vertical)
-            let page_w = GetDeviceCaps(Some(hdc), HORZRES) as f64;
-            let _page_h = GetDeviceCaps(Some(hdc), VERTRES) as f64;
+            let px_x = GetDeviceCaps(hdc, LOGPIXELSX) as f64 / 25.4; // píxeles por mm (horizontal)
+            let px_y = GetDeviceCaps(hdc, LOGPIXELSY) as f64 / 25.4; // píxeles por mm (vertical)
+            let page_w = GetDeviceCaps(hdc, HORZRES) as f64;
+            let _page_h = GetDeviceCaps(hdc, VERTRES) as f64;
             let _ = paper_size; // el tamaño real lo define la bandeja/config ya establecida en el driver de Windows
 
             let margin = 12.0 * px_x; // ~12mm de margen
