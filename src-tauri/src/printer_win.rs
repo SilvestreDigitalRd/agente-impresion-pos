@@ -258,11 +258,11 @@ mod win {
             }
 
             let mut y = margin;
-            let mut draw = |hdc: windows::Win32::Graphics::Gdi::HDC, x: f64, y: f64, text: &str| {
+            let draw = |hdc: windows::Win32::Graphics::Gdi::HDC, x: f64, y: f64, text: &str| {
                 let wide = to_wide(text);
                 let _ = TextOutW(hdc, x as i32, y as i32, &wide[..wide.len().saturating_sub(1)]);
             };
-            let mut divider = |hdc: windows::Win32::Graphics::Gdi::HDC, y: f64| {
+            let divider = |hdc: windows::Win32::Graphics::Gdi::HDC, y: f64| {
                 let mut prev = windows::Win32::Foundation::POINT::default();
                 let _ = MoveToEx(hdc, margin as i32, y as i32, Some(&mut prev));
                 let _ = LineTo(hdc, (page_w - margin) as i32, y as i32);
@@ -280,9 +280,12 @@ mod win {
             draw(hdc, margin, y, &format!("Fecha: {}", invoice.created_at)); y += line_h;
             draw(hdc, margin, y, &format!("Atendido por: {}", invoice.cashier_name)); y += line_h;
             if let Some(c) = &invoice.customer_name { draw(hdc, margin, y, &format!("Cliente: {c}")); y += line_h; }
-            draw(hdc, margin, y, if invoice.doc_type == "fiscal" {
-                &format!("NCF: {}", invoice.ncf.as_deref().unwrap_or("—"))
-            } else { "Ticket de venta (sin valor fiscal)" });
+            let doc_type_line = if invoice.doc_type == "fiscal" {
+                format!("NCF: {}", invoice.ncf.as_deref().unwrap_or("—"))
+            } else {
+                "Ticket de venta (sin valor fiscal)".to_string()
+            };
+            draw(hdc, margin, y, &doc_type_line);
             y += line_h;
             divider(hdc, y);
             y += line_h * 1.2;
