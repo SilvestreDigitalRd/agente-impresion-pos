@@ -52,10 +52,16 @@ struct PrintersResp {
 
 #[derive(Deserialize)]
 struct PrintReq {
+    // Modo térmico (existente): bytes ESC/POS ya armados en el navegador.
     #[serde(rename = "dataBase64")]
-    data_base64: String,
+    data_base64: Option<String>,
     #[serde(rename = "printerName")]
     printer_name: Option<String>,
+    // Modo hoja completa (A4/Carta): el agente arma la página con GDI a
+    // partir de datos estructurados — no llegan bytes de impresora crudos.
+    #[serde(rename = "paperSize")]
+    paper_size: Option<String>, // "a4" | "letter"
+    invoice: Option<printer_win::InvoiceDoc>,
 }
 
 #[derive(Serialize)]
@@ -117,18 +123,6 @@ async fn print(
         return e.into_response();
     }
 
-    use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let bytes = match STANDARD.decode(&body.data_base64) {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ErrorResp { error: "BASE64_INVALIDO".into(), detail: "".into() }),
-            )
-                .into_response()
-        }
-    };
-
     let printer_name = body
         .printer_name
         .filter(|n| !n.trim().is_empty())
@@ -144,6 +138,39 @@ async fn print(
             }),
         )
             .into_response();
+    };
+
+    // ---- Modo hoja completa (A4/Carta): datos estructurados + GDI --------
+    if let (Some(paper_size), Some(invoice)) = (&body.paper_size, &body.invoice) {
+        return match printer_win::print_a4_document(&printer_name, paper_size, invoice) {
+            Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+            Err(msg) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
+            )
+                .into_response(),
+        };
+    }
+
+    // ---- Modo térmico (existente): bytes ESC/POS crudos -------------------
+    let Some(data_base64) = &body.data_base64 else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResp { error: "FALTA_DATA_BASE64_O_INVOICE".into(), detail: "".into() }),
+        )
+            .into_response();
+    };
+
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = match STANDARD.decode(data_base64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(ErrorResp { error: "BASE64_INVALIDO".into(), detail: "".into() }),
+            )
+                .into_response()
+        }
     };
 
     // Único punto de contacto con el sistema operativo: escribir bytes
