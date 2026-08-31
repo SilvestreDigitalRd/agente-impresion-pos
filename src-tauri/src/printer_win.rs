@@ -33,6 +33,11 @@ pub struct InvoiceDoc {
     pub business_address: Option<String>,
     pub business_phone: Option<String>,
     pub created_at: String,
+    // El frontend YA manda este campo (ver buildInvoiceDoc en
+    // ticketFormat.js) — faltaba acá, así que Serde lo descartaba en
+    // silencio (por defecto ignora claves JSON sin campo que las reciba,
+    // no da ningún error), y nunca llegaba a imprimirse.
+    pub local_ticket_number: Option<String>,
     pub cashier_name: String,
     pub customer_name: Option<String>,
     pub doc_type: String,
@@ -278,6 +283,7 @@ mod win {
             y += line_h;
 
             draw(hdc, margin, y, &format!("Fecha: {}", invoice.created_at)); y += line_h;
+            if let Some(n) = &invoice.local_ticket_number { draw(hdc, margin, y, n); y += line_h; }
             draw(hdc, margin, y, &format!("Atendido por: {}", invoice.cashier_name)); y += line_h;
             if let Some(c) = &invoice.customer_name { draw(hdc, margin, y, &format!("Cliente: {c}")); y += line_h; }
             let doc_type_line = if invoice.doc_type == "fiscal" {
