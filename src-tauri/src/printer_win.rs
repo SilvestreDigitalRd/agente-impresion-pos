@@ -26,6 +26,24 @@ pub struct InvoiceItem {
     pub unit_price: f64,
 }
 
+/// Logo del negocio ya convertido a bitmap monocromo 1-bit-por-píxel por el
+/// frontend (misma función `logoToMonochromeRaster` que arma el logo para
+/// ESC/POS térmico y ePOS-Print XML — ver ticketFormat.js). Formato: fila
+/// empacada a bytes SIN relleno extra (bytesPerRow = widthPx/8, exacto
+/// porque widthPx ya es múltiplo de 8 del lado del navegador), bit=1 ->
+/// negro, bit=0 -> blanco, MSB primero. El agente solo tiene que reempacar
+/// cada fila al múltiplo de 4 bytes que exige un DIB de Windows — no vuelve
+/// a decidir umbral de blanco/negro ni redimensiona la imagen origen.
+#[derive(Deserialize, Clone)]
+pub struct LogoRaster {
+    #[serde(rename = "widthPx")]
+    pub width_px: u32,
+    #[serde(rename = "heightPx")]
+    pub height_px: u32,
+    #[serde(rename = "dataBase64")]
+    pub data_base64: String,
+}
+
 #[derive(Deserialize, Clone)]
 pub struct InvoiceDoc {
     pub business_name: String,
@@ -49,6 +67,10 @@ pub struct InvoiceDoc {
     pub total: f64,
     pub payment_method: String,
     pub footer: Option<String>,
+    // Ausente/null si el negocio no tiene logo configurado, o si el
+    // navegador no pudo cargarlo — mismo criterio de "nunca bloquear la
+    // venta" que ya rige en térmica/red (ver ticketFormat.js).
+    pub logo: Option<LogoRaster>,
 }
 
 #[cfg(target_os = "windows")]
@@ -192,6 +214,122 @@ mod win {
         }
     }
 
+    /// Dibuja el logo (bitmap monocromo 1-bit ya armado por el navegador)
+    /// dentro del contexto de impresión vía `StretchDIBits` — el mismo
+    /// mecanismo GDI que usa cualquier programa de Windows para pintar una
+    /// imagen, distinto del raster ESC/POS que ya usa el modo térmico.
+    /// Devuelve el alto real (en píxeles del dispositivo) que ocupó, para
+    /// que el llamador pueda avancer `y` después de dibujarlo.
+    ///
+    /// Nota de verificación: el resto de este archivo (imports de GDI,
+    /// GetDeviceCaps con su newtype, StartDocW/EndDoc en Storage::Xps) tuvo
+    /// varias rondas de CI hasta encontrar la firma exacta de windows-rs
+    /// 0.58 — esta función se armó cruzando la documentación pública de esa
+    /// misma versión (BITMAPINFOHEADER con biCompression: u32 plano, no un
+    /// newtype; StretchDIBits con lpbits: Option<*const c_void>, iusage:
+    /// DIB_USAGE, rop: ROP_CODE), pero **sin poder compilarla en este
+    /// sandbox** (mismo límite de siempre: sin Rust real para Windows acá).
+    /// Pendiente de confirmar en el próximo CI real, igual que el resto de
+    /// GDI en este proyecto.
+    fn draw_logo(
+        hdc: windows::Win32::Graphics::Gdi::HDC,
+        x: i32,
+        y: i32,
+        dest_w: i32,
+        logo: &super::LogoRaster,
+    ) -> Result<i32, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use windows::Win32::Graphics::Gdi::{
+            StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
+        };
+
+        let width = logo.width_px as usize;
+        let height = logo.height_px as usize;
+        if width == 0 || height == 0 {
+            return Err("El logo llegó con dimensiones inválidas.".into());
+        }
+
+        let bits = STANDARD
+            .decode(&logo.data_base64)
+            .map_err(|_| "El logo llegó en base64 inválido.".to_string())?;
+
+        // Formato de origen (armado por el navegador, ver LogoRaster): sin
+        // relleno extra, exacto porque width ya es múltiplo de 8 ahí.
+        let src_bytes_per_row = (width + 7) / 8;
+        if bits.len() != src_bytes_per_row * height {
+            return Err("El logo no coincide con las dimensiones declaradas.".into());
+        }
+
+        // Un DIB de Windows exige que cada fila termine en un múltiplo de 4
+        // bytes (frontera DWORD) — distinto del empaquetado "sin relleno"
+        // que usa ESC/POS, así que hay que reempacar fila por fila.
+        let dib_bytes_per_row = ((width + 31) / 32) * 4;
+        let mut dib_bits = vec![0u8; dib_bytes_per_row * height];
+        for row in 0..height {
+            let src_start = row * src_bytes_per_row;
+            let dst_start = row * dib_bytes_per_row;
+            dib_bits[dst_start..dst_start + src_bytes_per_row]
+                .copy_from_slice(&bits[src_start..src_start + src_bytes_per_row]);
+        }
+
+        // BITMAPINFO real solo reserva 1 entrada de color en su struct C
+        // (arreglo flexible) — necesitamos 2 (blanco/negro) para 1bpp, así
+        // que se arma a mano el layout exacto que Windows espera leer en
+        // memoria (header seguido de la paleta), y se pasa el puntero como
+        // *const BITMAPINFO para calzar con la firma de la función.
+        #[repr(C)]
+        struct BitmapInfo1Bpp {
+            header: BITMAPINFOHEADER,
+            colors: [RGBQUAD; 2],
+        }
+        let bmi = BitmapInfo1Bpp {
+            header: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: width as i32,
+                // Negativo = DIB top-down (origen arriba-izquierda) — así
+                // no hace falta invertir las filas, ya vienen en ese orden
+                // desde el canvas del navegador.
+                biHeight: -(height as i32),
+                biPlanes: 1,
+                biBitCount: 1,
+                biCompression: 0, // BI_RGB
+                biSizeImage: 0,
+                biXPelsPerMeter: 0,
+                biYPelsPerMeter: 0,
+                biClrUsed: 0,
+                biClrImportant: 0,
+            },
+            colors: [
+                RGBQUAD { rgbBlue: 255, rgbGreen: 255, rgbRed: 255, rgbReserved: 0 }, // índice 0 = blanco (bit 0)
+                RGBQUAD { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbReserved: 0 },       // índice 1 = negro (bit 1)
+            ],
+        };
+
+        let dest_h = ((height as f64) * (dest_w as f64) / (width as f64)).round() as i32;
+
+        unsafe {
+            let drawn = StretchDIBits(
+                hdc,
+                x,
+                y,
+                dest_w,
+                dest_h,
+                0,
+                0,
+                width as i32,
+                height as i32,
+                Some(dib_bits.as_ptr() as *const core::ffi::c_void),
+                &bmi as *const BitmapInfo1Bpp as *const BITMAPINFO,
+                DIB_RGB_COLORS,
+                SRCCOPY,
+            );
+            if drawn <= 0 {
+                return Err("No se pudo dibujar el logo (StretchDIBits).".into());
+            }
+        }
+        Ok(dest_h)
+    }
+
     /// Imprime una factura como HOJA COMPLETA (A4 o Carta) en una impresora
     /// normal instalada en Windows, dibujando el contenido vía GDI —
     /// exactamente el mismo mecanismo que usa cualquier programa de Windows
@@ -263,6 +401,20 @@ mod win {
             }
 
             let mut y = margin;
+
+            // Logo (si el negocio tiene uno configurado) — bitmap ya armado
+            // por el navegador, dibujado vía GDI antes que el resto del
+            // texto. Un logo roto o que no dibuja nunca debe bloquear la
+            // impresión de la factura (mismo criterio que térmica/red).
+            if let Some(logo) = &invoice.logo {
+                let logo_w = (page_w - margin * 2.0) * 0.35; // banner discreto, no domina la hoja
+                let logo_x = margin + ((page_w - margin * 2.0) - logo_w) / 2.0; // centrado
+                match draw_logo(hdc, logo_x as i32, y as i32, logo_w as i32, logo) {
+                    Ok(drawn_h) => y += drawn_h as f64 + line_h * 0.5,
+                    Err(_) => { /* logo roto: se sigue sin él, no se aborta la impresión */ }
+                }
+            }
+
             let draw = |hdc: windows::Win32::Graphics::Gdi::HDC, x: f64, y: f64, text: &str| {
                 let wide = to_wide(text);
                 let _ = TextOutW(hdc, x as i32, y as i32, &wide[..wide.len().saturating_sub(1)]);
