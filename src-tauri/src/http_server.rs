@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
+use tower_http::limit::RequestBodyLimitLayer;
 
 #[derive(Clone)]
 struct Ctx {
@@ -75,7 +76,7 @@ fn check_token(headers: &HeaderMap, ctx: &Ctx) -> Result<(), (StatusCode, Json<E
         .get("x-agent-token")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    let expected = ctx.state.0.lock().unwrap().pairing_token.clone();
+    let expected = ctx.state.lock().pairing_token.clone();
     if provided.is_empty() || !tokens_match(provided, &expected) {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -126,7 +127,7 @@ async fn print(
     let printer_name = body
         .printer_name
         .filter(|n| !n.trim().is_empty())
-        .or_else(|| ctx.state.0.lock().unwrap().default_printer.clone())
+        .or_else(|| ctx.state.lock().default_printer.clone())
         .or_else(printer_win::default_printer);
 
     let Some(printer_name) = printer_name else {
@@ -141,12 +142,33 @@ async fn print(
     };
 
     // ---- Modo hoja completa (A4/Carta): datos estructurados + GDI --------
-    if let (Some(paper_size), Some(invoice)) = (&body.paper_size, &body.invoice) {
-        return match printer_win::print_a4_document(&printer_name, paper_size, invoice) {
-            Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-            Err(msg) => (
+    if let (Some(paper_size), Some(invoice)) = (body.paper_size.clone(), body.invoice.clone()) {
+        // spawn_blocking: print_a4_document hace llamadas Win32 SÍNCRONAS
+        // (StartDocW, StretchDIBits, etc.) — corridas directo en el handler
+        // async, una impresora lenta o atascada bloquearía este hilo del
+        // runtime de tokio, dejando /health y /printers sin responder
+        // mientras dura. spawn_blocking las manda a un hilo dedicado para
+        // trabajo bloqueante, sin retener el runtime async.
+        let printer_name_owned = printer_name.clone();
+        let join_result = tokio::task::spawn_blocking(move || {
+            printer_win::print_a4_document(&printer_name_owned, &paper_size, &invoice)
+        })
+        .await;
+
+        return match join_result {
+            Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(Err(msg)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
+            )
+                .into_response(),
+            // El hilo de impresión entró en pánico (ej. un bug real en el
+            // layout manual del logo, ver printer_win.rs) — se informa como
+            // error de impresión en vez de tumbar el proceso entero, que es
+            // lo que pasaría si el pánico llegara sin atajar hasta acá.
+            Err(join_err) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
             )
                 .into_response(),
         };
@@ -175,19 +197,27 @@ async fn print(
 
     // Único punto de contacto con el sistema operativo: escribir bytes
     // crudos al spooler vía la API nativa de Win32. Nunca un shell.
-    match printer_win::print_raw(&printer_name, &bytes) {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Err(msg) => (
+    // Mismo motivo que arriba: spawn_blocking para no retener el runtime
+    // async mientras el spooler procesa el trabajo.
+    let join_result = tokio::task::spawn_blocking(move || printer_win::print_raw(&printer_name, &bytes)).await;
+    match join_result {
+        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Err(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
         )
             .into_response(),
     }
 }
 
 pub async fn run(state: Arc<AppState>) {
-    let port = state.0.lock().unwrap().port;
-    let allowed_origin = state.0.lock().unwrap().allowed_origin.clone();
+    let port = state.lock().port;
+    let allowed_origin = state.lock().allowed_origin.clone();
 
     let origin: HeaderValue = allowed_origin
         .parse()
@@ -212,6 +242,14 @@ pub async fn run(state: Arc<AppState>) {
         .route("/printers", get(printers))
         .route("/print", post(print))
         .layer(cors)
+        // Límite explícito de tamaño de body — antes no había ninguno, así
+        // que /print aceptaba un dataBase64/logo.dataBase64 de cualquier
+        // tamaño. Un payload de cientos de MB (token filtrado, o frontend
+        // comprometido) podía agotar la memoria del proceso y colgar el
+        // agente de esa caja. 10MB sobra de sobra para un ticket térmico o
+        // un logo — se aplica DESPUÉS de cors (como capa más externa), para
+        // que corte el body antes de que cualquier otra capa lo procese.
+        .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
         .with_state(ctx);
 
     // Bind EXCLUSIVO a loopback. 0.0.0.0 expondría el agente a toda la LAN

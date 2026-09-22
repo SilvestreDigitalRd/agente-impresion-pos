@@ -30,7 +30,7 @@ struct StatusPayload {
 
 #[tauri::command]
 fn get_status(state: TauriState<Arc<AppState>>) -> StatusPayload {
-    let cfg = state.0.lock().unwrap();
+    let cfg = state.lock();
     StatusPayload {
         pairing_token: cfg.pairing_token.clone(),
         allowed_origin: cfg.allowed_origin.clone(),
@@ -42,7 +42,7 @@ fn get_status(state: TauriState<Arc<AppState>>) -> StatusPayload {
 
 #[tauri::command]
 fn regenerate_token(state: TauriState<Arc<AppState>>) -> String {
-    let mut cfg = state.0.lock().unwrap();
+    let mut cfg = state.lock();
     cfg.regenerate_token();
     cfg.pairing_token.clone()
 }
@@ -61,7 +61,7 @@ fn save_settings(
 ) -> Result<(), String> {
     // El puerto NO se puede cambiar en caliente sin reiniciar el servidor
     // (queda fijo tras el primer arranque); todo lo demás sí se aplica ya.
-    let mut cfg = state.0.lock().unwrap();
+    let mut cfg = state.lock();
     cfg.allowed_origin = allowed_origin;
     cfg.default_printer = default_printer;
     cfg.autostart = autostart;

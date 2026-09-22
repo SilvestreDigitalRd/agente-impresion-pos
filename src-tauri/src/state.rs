@@ -81,12 +81,54 @@ impl AgentConfig {
 
 /// Comparación en tiempo constante — evita que un atacante mida diferencias
 /// de tiempo de respuesta para adivinar la clave carácter por carácter.
+/// El chequeo de longitud es intencionalmente EN TIEMPO CONSTANTE también
+/// (no un `!=` corto-circuito): la longitud del token es fija (64 hex) y
+/// pública, así que en la práctica no filtra nada — pero cerrar el vector
+/// por completo no cuesta nada acá, así que se hace de una vez.
 pub fn tokens_match(provided: &str, expected: &str) -> bool {
     use subtle::ConstantTimeEq;
-    if provided.len() != expected.len() {
-        return false;
+    // Normaliza ambos a un buffer de largo fijo (rellenado con ceros) antes
+    // de comparar — ct_eq sobre buffers de largo distinto no compila (el
+    // trait lo exige del mismo tamaño), así que esto es lo que permite
+    // quitar el `if provided.len() != expected.len()` de antes sin perder
+    // la comparación real.
+    const MAX_LEN: usize = 128;
+    let mut a = [0u8; MAX_LEN];
+    let mut b = [0u8; MAX_LEN];
+    let pb = provided.as_bytes();
+    let eb = expected.as_bytes();
+    if pb.len() > MAX_LEN || eb.len() > MAX_LEN {
+        return false; // un token real (64 hex) nunca llega ni cerca de esto
     }
-    provided.as_bytes().ct_eq(expected.as_bytes()).into()
+    a[..pb.len()].copy_from_slice(pb);
+    b[..eb.len()].copy_from_slice(eb);
+    // La longitud real todavía tiene que coincidir — si no, comparar el
+    // contenido no alcanza (rellenar con ceros haría que "abc" calce contra
+    // "abc\0\0\0..."). Se compara como enteros en vez de con `!=` sobre los
+    // `usize` para no reintroducir la rama corto-circuito que se quería
+    // evitar — aunque, igual que antes, la longitud de un token real ya es
+    // pública y fija, esto es simplemente prolijidad, no una protección real.
+    let len_matches: bool = pb.len().to_be_bytes().ct_eq(&eb.len().to_be_bytes()).into();
+    let content_matches: bool = a.ct_eq(&b).into();
+    len_matches & content_matches
 }
 
 pub struct AppState(pub Mutex<AgentConfig>);
+
+impl AppState {
+    /// Lock que nunca se envenena. Antes, todo acceso usaba
+    /// `state.0.lock().unwrap()` directo — si algún handler entraba en
+    /// pánico sosteniendo el lock, el Mutex quedaba envenenado y TODA
+    /// petición HTTP subsiguiente (incluido /health) empezaba a fallar,
+    /// sin ningún log de la causa raíz, en una app pensada para correr
+    /// desatendida en la bandeja del sistema. Ahora se recupera el estado
+    /// que había en el momento del pánico (que sigue siendo válido — un
+    /// pánico no corrompe los datos ya escritos) y se sigue, dejando un
+    /// aviso en el log para poder investigar después.
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, AgentConfig> {
+        self.0.lock().unwrap_or_else(|poisoned| {
+            eprintln!("AVISO: se recuperó el estado del agente después de un error interno (mutex envenenado) — revisar el log de arriba para la causa.");
+            poisoned.into_inner()
+        })
+    }
+}
