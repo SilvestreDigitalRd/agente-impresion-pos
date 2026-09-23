@@ -54,11 +54,23 @@ fn list_printers_cmd() -> Result<Vec<String>, String> {
 
 #[tauri::command]
 fn save_settings(
+    app: tauri::AppHandle,
     state: TauriState<Arc<AppState>>,
     allowed_origin: String,
     default_printer: Option<String>,
     autostart: bool,
 ) -> Result<(), String> {
+    // Antes esta función SOLO guardaba `autostart` en config.json — nunca
+    // llamaba al plugin, así que tildar/destildar "Iniciar con Windows" no
+    // hacía nada de verdad en el sistema operativo (el plugin quedaba
+    // registrado pero jamás se invocaba enable()/disable()). Se corrige
+    // acá: el checkbox ahora sí prende/apaga el registro real de Windows,
+    // antes de guardar la preferencia.
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let sync_result = if autostart { autolaunch.enable() } else { autolaunch.disable() };
+    sync_result.map_err(|e| format!("No se pudo actualizar el inicio automático de Windows: {e}"))?;
+
     // El puerto NO se puede cambiar en caliente sin reiniciar el servidor
     // (queda fijo tras el primer arranque); todo lo demás sí se aplica ya.
     let mut cfg = state.lock();
@@ -74,6 +86,7 @@ fn save_settings(
 
 fn main() {
     let config = AgentConfig::load_or_create();
+    let initial_autostart = config.autostart;
     let shared = Arc::new(AppState(Mutex::new(config)));
     let http_state = shared.clone();
 
@@ -90,6 +103,20 @@ fn main() {
             save_settings
         ])
         .setup(move |app| {
+            // Sincroniza el registro REAL de Windows con lo que dice
+            // config.json en cada arranque — no alcanza con hacerlo una
+            // sola vez al instalar: si el usuario lo saca a mano de
+            // "Aplicaciones de inicio" de Windows (sin pasar por esta
+            // configuración), el agente lo vuelve a registrar solo la
+            // próxima vez que arranque, en vez de quedar desincronizado
+            // en silencio para siempre.
+            use tauri_plugin_autostart::ManagerExt;
+            let autolaunch = app.autolaunch();
+            let sync_result = if initial_autostart { autolaunch.enable() } else { autolaunch.disable() };
+            if let Err(e) = sync_result {
+                eprintln!("AVISO: no se pudo sincronizar el inicio automático con Windows al arrancar: {e}");
+            }
+
             // Servidor HTTP en un hilo async separado — nunca bloquea la UI.
             tauri::async_runtime::spawn(http_server::run(http_state));
 
