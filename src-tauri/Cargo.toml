@@ -19,6 +19,14 @@ rand = "0.8"
 subtle = "2.5"          # comparación de tokens en tiempo constante (anti timing-attack)
 base64 = "0.22"
 dirs = "5"
+# Auditoría, hallazgo A9: reenvía la impresión en red HACIA la LAN desde
+# ACÁ (el agente), no desde el navegador — un navegador en HTTPS (Vercel)
+# no puede hacerle fetch() a http://<ip-lan> por contenido mixto, así que
+# el modo "red" quedaba roto en producción. El agente no tiene esa
+# restricción del navegador. rustls en vez de openssl-sys: sin dependencia
+# nativa de OpenSSL que compilar en Windows, y no hace falta TLS de
+# verdad acá (la impresora habla HTTP plano en la LAN).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 # Enlaces directos a la API de impresión de Win32 — CERO llamadas a cmd.exe/shell.
 # Esto es lo que elimina por completo el riesgo de inyección de comandos.

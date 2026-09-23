@@ -65,6 +65,14 @@ struct PrintReq {
     invoice: Option<printer_win::InvoiceDoc>,
 }
 
+#[derive(Deserialize)]
+struct PrintNetworkReq {
+    #[serde(rename = "networkIp")]
+    network_ip: String,
+    #[serde(rename = "xmlBody")]
+    xml_body: String,
+}
+
 #[derive(Serialize)]
 struct ErrorResp {
     error: String,
@@ -215,6 +223,82 @@ async fn print(
     }
 }
 
+/**
+ * POST /print-network — reenvía un documento ePOS-Print (XML ya armado
+ * por el frontend) hacia una impresora de red en la LAN.
+ *
+ * Auditoría, hallazgo A9: antes el NAVEGADOR le hacía fetch() directo a
+ * http://<ip-lan> — con el frontend en HTTPS (Vercel), eso es contenido
+ * mixto activo y los navegadores lo bloquean, así que "Impresora de red"
+ * ya no imprimía nada en producción. Un `fetch` de acá (proceso nativo,
+ * no un navegador) no tiene esa restricción — 127.0.0.1 SÍ es de
+ * confianza para el navegador (por eso /print ya funcionaba), la LAN NO.
+ *
+ * `is_private()` (además del `X-Agent-Token` de siempre) evita que este
+ * endpoint se use como un proxy HTTP abierto hacia cualquier IP —
+ * defensa en profundidad, aunque el backend YA valida que network_ip sea
+ * una IPv4 privada antes de guardarlo.
+ */
+async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): Json<PrintNetworkReq>) -> impl IntoResponse {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+
+    let Ok(ip) = body.network_ip.parse::<std::net::Ipv4Addr>() else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResp { error: "IP_INVALIDA".into(), detail: "".into() }),
+        )
+            .into_response();
+    };
+    if !(ip.is_private() || ip.is_loopback() || ip.is_link_local()) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ErrorResp {
+                error: "IP_NO_PRIVADA".into(),
+                detail: "Solo se permite reenviar a direcciones de red local (LAN).".into(),
+            }),
+        )
+            .into_response();
+    }
+
+    let url = format!("http://{ip}/cgi-bin/epos/service.cgi?devid=local_printer&timeout=10000");
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResp { error: "CLIENTE_HTTP_FALLO".into(), detail: e.to_string() }),
+            )
+                .into_response()
+        }
+    };
+
+    match client
+        .post(&url)
+        .header("Content-Type", "text/xml; charset=utf-8")
+        .header("If-Modified-Since", "Thu, 01 Jan 1970 00:00:00 GMT")
+        .body(body.xml_body)
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(resp) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResp { error: "IMPRESORA_RED_ERROR".into(), detail: format!("HTTP {}", resp.status()) }),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResp { error: "IMPRESORA_RED_INALCANZABLE".into(), detail: e.to_string() }),
+        )
+            .into_response(),
+    }
+}
+
 pub async fn run(state: Arc<AppState>) {
     let port = state.lock().port;
     let allowed_origin = state.lock().allowed_origin.clone();
@@ -241,6 +325,7 @@ pub async fn run(state: Arc<AppState>) {
         .route("/health", get(health))
         .route("/printers", get(printers))
         .route("/print", post(print))
+        .route("/print-network", post(print_network))
         .layer(cors)
         // Límite explícito de tamaño de body — antes no había ninguno, así
         // que /print aceptaba un dataBase64/logo.dataBase64 de cualquier
