@@ -53,23 +53,67 @@ fn config_path() -> PathBuf {
     dir
 }
 
+/// Log en disco muy simple — `eprintln!` no sirve para nada acá porque
+/// `windows_subsystem = "windows"` (sin consola) se traga toda salida
+/// estándar; sin esto, un problema en una PC de un cliente era
+/// invisible por completo (auditoría, hallazgo M17). Sin rotación ni
+/// dependencias nuevas a propósito — un archivo de texto plano que se
+/// puede abrir y mandar por WhatsApp si hace falta soporte remoto.
+pub fn log_line(msg: &str) {
+    use std::io::Write;
+    let mut dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
+    dir.push("AgenteImpresionFacturacion");
+    fs::create_dir_all(&dir).ok();
+    dir.push("agente.log");
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&dir) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{now}] {msg}");
+    }
+}
+
 impl AgentConfig {
     pub fn load_or_create() -> Self {
         let path = config_path();
         if let Ok(raw) = fs::read_to_string(&path) {
-            if let Ok(cfg) = serde_json::from_str::<AgentConfig>(&raw) {
-                return cfg;
+            match serde_json::from_str::<AgentConfig>(&raw) {
+                Ok(cfg) => return cfg,
+                Err(e) => {
+                    // Auditoría M17: antes esto pisaba el archivo corrupto en
+                    // silencio con una config nueva — CON UN pairing_token
+                    // NUEVO, lo que rompe el emparejamiento con el backend
+                    // sin ningún aviso. Ahora el archivo dañado se guarda
+                    // aparte (para poder mirarlo/recuperarlo a mano) y queda
+                    // registrado en el log.
+                    log_line(&format!("config.json no se pudo leer ({e}) — se hace backup y se crea una config nueva"));
+                    let mut backup = path.clone();
+                    backup.set_file_name("config.json.corrupto");
+                    let _ = fs::rename(&path, &backup);
+                }
             }
         }
         let cfg = AgentConfig::default();
         cfg.save();
+        log_line("config.json creado desde cero (primera vez, o el anterior estaba corrupto)");
         cfg
     }
 
     pub fn save(&self) {
         let path = config_path();
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let _ = fs::write(path, json);
+        let Ok(json) = serde_json::to_string_pretty(self) else { return };
+        // Escritura atómica (auditoría M17): escribir directo al archivo
+        // final significa que un corte de luz/crash a mitad de la escritura
+        // deja config.json truncado — el próximo arranque lo trataría como
+        // corrupto (ver load_or_create) y regeneraría el pairing_token sin
+        // que nadie lo pidiera. Escribir a un .tmp y renombrar es atómico
+        // en el mismo filesystem: o queda el archivo viejo completo, o
+        // queda el nuevo completo, nunca algo a medias.
+        let mut tmp_path = path.clone();
+        tmp_path.set_extension("json.tmp");
+        if fs::write(&tmp_path, json).is_ok() {
+            let _ = fs::rename(&tmp_path, &path);
         }
     }
 

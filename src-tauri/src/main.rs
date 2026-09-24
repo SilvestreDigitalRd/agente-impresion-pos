@@ -86,6 +86,7 @@ fn save_settings(
 
 fn main() {
     let config = AgentConfig::load_or_create();
+    crate::state::log_line(&format!("Agente iniciado — versión {}", env!("CARGO_PKG_VERSION")));
     let initial_autostart = config.autostart;
     let shared = Arc::new(AppState(Mutex::new(config)));
     let http_state = shared.clone();

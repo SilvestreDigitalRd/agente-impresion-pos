@@ -37,6 +37,46 @@ use tower_http::limit::RequestBodyLimitLayer;
 #[derive(Clone)]
 struct Ctx {
     state: Arc<AppState>,
+    print_guard: Arc<PrintGuard>,
+}
+
+/**
+ * Auditoría, hallazgo M5: antes CADA /print lanzaba su propio
+ * spawn_blocking sin ningún límite — si el spooler de Windows se
+ * atascaba, los hilos bloqueantes se iban acumulando sin techo (hasta el
+ * tope de 512 de Tokio). Tampoco había forma de detectar un reintento del
+ * mismo trabajo (el usuario hace doble clic, o el frontend reintenta tras
+ * un timeout) — eso imprimía el ticket dos veces, y si el comando abre la
+ * gaveta de dinero (bytes ESC/POS), la abría dos veces también.
+ */
+struct PrintGuard {
+    // Como mucho 2 impresiones físicas en simultáneo — de sobra para una
+    // caja con impresora de recibo + una de cocina, por ejemplo, pero
+    // acota el problema de raíz si el spooler se cuelga.
+    semaphore: tokio::sync::Semaphore,
+    recent_jobs: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl PrintGuard {
+    fn new() -> Self {
+        Self {
+            semaphore: tokio::sync::Semaphore::new(2),
+            recent_jobs: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// true si este jobId ya se procesó hace menos de 60s — se descarta
+    /// como duplicado en vez de imprimir de nuevo. Limpieza barata de
+    /// entradas viejas en cada llamada, sin tarea de fondo aparte.
+    fn is_duplicate(&self, job_id: &str) -> bool {
+        let mut jobs = self.recent_jobs.lock().unwrap_or_else(|p| p.into_inner());
+        jobs.retain(|_, t| t.elapsed() < std::time::Duration::from_secs(60));
+        if jobs.contains_key(job_id) {
+            return true;
+        }
+        jobs.insert(job_id.to_string(), std::time::Instant::now());
+        false
+    }
 }
 
 #[derive(Serialize)]
@@ -63,6 +103,12 @@ struct PrintReq {
     #[serde(rename = "paperSize")]
     paper_size: Option<String>, // "a4" | "letter"
     invoice: Option<printer_win::InvoiceDoc>,
+    // Auditoría, hallazgo M5: id estable del trabajo (el frontend manda
+    // invoice.id) — permite descartar un reintento del MISMO trabajo sin
+    // imprimir dos veces. Opcional por compatibilidad con un frontend
+    // viejo que todavía no lo mande.
+    #[serde(rename = "jobId")]
+    job_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -132,6 +178,16 @@ async fn print(
         return e.into_response();
     }
 
+    // Dedup por jobId (auditoría M5) — un reintento del MISMO trabajo
+    // dentro de los últimos 60s se descarta como éxito silencioso en vez
+    // de volver a imprimir. Sin jobId (frontend viejo), no hay nada que
+    // deduplicar — se sigue de largo como siempre.
+    if let Some(job_id) = &body.job_id {
+        if ctx.print_guard.is_duplicate(job_id) {
+            return Json(serde_json::json!({ "ok": true, "deduped": true })).into_response();
+        }
+    }
+
     let printer_name = body
         .printer_name
         .filter(|n| !n.trim().is_empty())
@@ -158,27 +214,53 @@ async fn print(
         // mientras dura. spawn_blocking las manda a un hilo dedicado para
         // trabajo bloqueante, sin retener el runtime async.
         let printer_name_owned = printer_name.clone();
-        let join_result = tokio::task::spawn_blocking(move || {
-            printer_win::print_a4_document(&printer_name_owned, &paper_size, &invoice)
-        })
+        // Semáforo (M5): espera si ya hay 2 impresiones físicas en curso,
+        // en vez de lanzar un hilo bloqueante más sin límite.
+        let _permit = ctx.print_guard.semaphore.acquire().await;
+        // Timeout (M5): si el spooler se cuelga, quien llamó a /print no
+        // se queda esperando para siempre — a los 30s se le devuelve un
+        // error igual. OJO: esto NO cancela el trabajo bloqueante en sí
+        // (Win32 no da forma de cancelar una llamada síncrona a mitad de
+        // camino) — el hilo sigue corriendo de fondo; el timeout acota
+        // cuánto espera el HTTP, no cuánto tarda realmente la impresora.
+        let join_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            tokio::task::spawn_blocking(move || {
+                printer_win::print_a4_document(&printer_name_owned, &paper_size, &invoice)
+            }),
+        )
         .await;
 
         return match join_result {
-            Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-            Ok(Err(msg)) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
-            )
-                .into_response(),
+            Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(Ok(Err(msg))) => {
+                crate::state::log_line(&format!("Fallo de impresión (A4/hoja completa): {msg}"));
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
+                )
+                    .into_response()
+            }
             // El hilo de impresión entró en pánico (ej. un bug real en el
             // layout manual del logo, ver printer_win.rs) — se informa como
             // error de impresión en vez de tumbar el proceso entero, que es
             // lo que pasaría si el pánico llegara sin atajar hasta acá.
-            Err(join_err) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
-            )
-                .into_response(),
+            Ok(Err(join_err)) => {
+                crate::state::log_line(&format!("Pánico en el hilo de impresión (A4): {join_err}"));
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
+                )
+                    .into_response()
+            }
+            Err(_elapsed) => {
+                crate::state::log_line("Impresión A4 excedió el tiempo límite (30s)");
+                (
+                    StatusCode::GATEWAY_TIMEOUT,
+                    Json(ErrorResp { error: "IMPRESION_TIMEOUT".into(), detail: "La impresora no respondió a tiempo (30s).".into() }),
+                )
+                    .into_response()
+            }
         };
     }
 
@@ -206,20 +288,40 @@ async fn print(
     // Único punto de contacto con el sistema operativo: escribir bytes
     // crudos al spooler vía la API nativa de Win32. Nunca un shell.
     // Mismo motivo que arriba: spawn_blocking para no retener el runtime
-    // async mientras el spooler procesa el trabajo.
-    let join_result = tokio::task::spawn_blocking(move || printer_win::print_raw(&printer_name, &bytes)).await;
+    // async mientras el spooler procesa el trabajo, más semáforo+timeout
+    // (M5) igual que el modo A4.
+    let _permit = ctx.print_guard.semaphore.acquire().await;
+    let join_result = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        tokio::task::spawn_blocking(move || printer_win::print_raw(&printer_name, &bytes)),
+    )
+    .await;
     match join_result {
-        Ok(Ok(())) => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(Err(msg)) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
-        )
-            .into_response(),
-        Err(join_err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
-        )
-            .into_response(),
+        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Ok(Err(msg))) => {
+            crate::state::log_line(&format!("Fallo de impresión (térmica): {msg}"));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
+            )
+                .into_response()
+        }
+        Ok(Err(join_err)) => {
+            crate::state::log_line(&format!("Pánico en el hilo de impresión (térmica): {join_err}"));
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
+            )
+                .into_response()
+        }
+        Err(_elapsed) => {
+            crate::state::log_line("Impresión térmica excedió el tiempo límite (30s)");
+            (
+                StatusCode::GATEWAY_TIMEOUT,
+                Json(ErrorResp { error: "IMPRESION_TIMEOUT".into(), detail: "La impresora no respondió a tiempo (30s).".into() }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -286,16 +388,22 @@ async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): J
         .await
     {
         Ok(resp) if resp.status().is_success() => Json(serde_json::json!({ "ok": true })).into_response(),
-        Ok(resp) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResp { error: "IMPRESORA_RED_ERROR".into(), detail: format!("HTTP {}", resp.status()) }),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            Json(ErrorResp { error: "IMPRESORA_RED_INALCANZABLE".into(), detail: e.to_string() }),
-        )
-            .into_response(),
+        Ok(resp) => {
+            crate::state::log_line(&format!("Impresora de red respondió error: HTTP {}", resp.status()));
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResp { error: "IMPRESORA_RED_ERROR".into(), detail: format!("HTTP {}", resp.status()) }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            crate::state::log_line(&format!("Impresora de red inalcanzable ({ip}): {e}"));
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResp { error: "IMPRESORA_RED_INALCANZABLE".into(), detail: e.to_string() }),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -320,7 +428,7 @@ pub async fn run(state: Arc<AppState>) {
             axum::http::HeaderName::from_static("x-agent-token"),
         ]);
 
-    let ctx = Ctx { state: state.clone() };
+    let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
     let app = Router::new()
         .route("/health", get(health))
         .route("/printers", get(printers))
