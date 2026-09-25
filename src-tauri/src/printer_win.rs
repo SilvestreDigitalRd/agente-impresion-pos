@@ -81,7 +81,7 @@ mod win {
     use windows::Win32::Graphics::Printing::{
         ClosePrinter, EndDocPrinter, EndPagePrinter, EnumPrintersW, GetDefaultPrinterW,
         OpenPrinterW, StartDocPrinterW, StartPagePrinter, WritePrinter, DOC_INFO_1W,
-        PRINTER_ENUM_LOCAL, PRINTER_INFO_2W,
+        PRINTER_ENUM_LOCAL, PRINTER_ENUM_CONNECTIONS, PRINTER_INFO_2W,
     };
 
     /// Normaliza el resultado de una llamada Win32 que puede volver como
@@ -107,15 +107,35 @@ mod win {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
+    /// RAII para HANDLE de impresora (auditoría, hallazgo B3): antes cada
+    /// función que abría una impresora tenía que acordarse de llamar
+    /// ClosePrinter en TODOS sus caminos de salida a mano — si algo
+    /// entraba en pánico entre OpenPrinterW y el ClosePrinter correspondiente
+    /// (poco probable hoy, pero un cambio futuro que agregue una operación
+    /// falible en el medio lo haría fácil), el handle quedaba filtrado.
+    /// Con esto, se cierra solo al salir de scope pase lo que pase.
+    struct PrinterHandleGuard(HANDLE);
+    impl Drop for PrinterHandleGuard {
+        fn drop(&mut self) {
+            unsafe { let _ = ClosePrinter(self.0); }
+        }
+    }
+
     pub fn list_printers() -> Result<Vec<String>, String> {
         unsafe {
+            // Auditoría B3: antes solo PRINTER_ENUM_LOCAL — una impresora de
+            // red ya CONECTADA en Windows (no instalada localmente, sino
+            // agregada como conexión de red) no aparecía en la lista. Se
+            // combinan los dos flags, como recomienda la documentación de
+            // Win32 para listar "todo lo que este usuario puede imprimir".
+            let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
             let mut needed: u32 = 0;
             let mut returned: u32 = 0;
             // Primera llamada solo para saber cuántos bytes hacen falta
             // (firma real: 6 parámetros — sin argumento de tamaño aparte,
             // el largo va implícito en el slice de `pprinterenum`).
             let _ = EnumPrintersW(
-                PRINTER_ENUM_LOCAL,
+                flags,
                 PCWSTR::null(),
                 2,
                 None,
@@ -125,12 +145,23 @@ mod win {
             if needed == 0 {
                 return Ok(vec![]);
             }
-            let mut buf = vec![0u8; needed as usize];
+            // Alineación (auditoría B3): un Vec<u8> solo garantiza
+            // alineación de 1 byte, pero PRINTER_INFO_2W (con punteros de
+            // 8 bytes en Windows de 64 bits) necesita alineación de 8 —
+            // leerlo de un buffer de bytes crudo es, técnicamente,
+            // comportamiento indefinido, aunque en la práctica el
+            // allocator casi siempre devuelva memoria ya alineada así.
+            // Alojar como Vec<u64> (redondeando hacia arriba) fuerza la
+            // alineación correcta, y se lo pasa a la API como puntero a
+            // bytes igual — sigue escribiendo la misma cantidad de bytes.
+            let words = needed.div_ceil(8) as usize;
+            let mut buf: Vec<u64> = vec![0u64; words];
+            let buf_bytes: &mut [u8] = std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, needed as usize);
             let ok = EnumPrintersW(
-                PRINTER_ENUM_LOCAL,
+                flags,
                 PCWSTR::null(),
                 2,
-                Some(&mut buf),
+                Some(buf_bytes),
                 &mut needed,
                 &mut returned,
             );
@@ -147,6 +178,8 @@ mod win {
                     names.push(item.pPrinterName.to_string().unwrap_or_default());
                 }
             }
+            names.sort();
+            names.dedup(); // una impresora local y su conexión de red podrían listarse dos veces
             Ok(names)
         }
     }
@@ -179,6 +212,10 @@ mod win {
             let mut handle = HANDLE::default();
             OpenPrinterW(PCWSTR(wide_name.as_ptr()), &mut handle, None)
                 .map_err(|e| format!("No se pudo abrir la impresora '{printer_name}': {e}"))?;
+            // A partir de acá el handle se cierra SOLO al salir de scope,
+            // sin importar por cuál `return`/pánico salga esta función —
+            // ya no hace falta acordarse de ClosePrinter en cada camino.
+            let _guard = PrinterHandleGuard(handle);
 
             let doc_name = to_wide("Ticket de venta");
             let datatype = to_wide("RAW");
@@ -190,13 +227,11 @@ mod win {
 
             let job_id = StartDocPrinterW(handle, 1, &doc_info);
             if job_id == 0 {
-                let _ = ClosePrinter(handle);
                 return Err("No se pudo iniciar el trabajo de impresión (StartDocPrinter).".into());
             }
 
             if !StartPagePrinter(handle).succeeded() {
                 let _ = EndDocPrinter(handle);
-                let _ = ClosePrinter(handle);
                 return Err("No se pudo iniciar la página de impresión.".into());
             }
 
@@ -205,7 +240,6 @@ mod win {
 
             let _ = EndPagePrinter(handle);
             let _ = EndDocPrinter(handle);
-            let _ = ClosePrinter(handle);
 
             if !write_ok.succeeded() || (written as usize) != data.len() {
                 return Err("Fallo al escribir los datos en el spooler de impresión.".into());

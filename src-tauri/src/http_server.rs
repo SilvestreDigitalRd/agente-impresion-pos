@@ -23,7 +23,7 @@ use crate::printer_win;
 use crate::state::{tokens_match, AppState};
 use axum::{
     extract::State,
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
@@ -125,7 +125,38 @@ struct ErrorResp {
     detail: String,
 }
 
+/**
+ * Verifica el token (ver arriba) y, además (auditoría, hallazgo B4),
+ * Origin/Host — el token ya mitiga un ataque de DNS rebinding (sin el
+ * token correcto, no importa desde qué Host/Origin llegue la petición,
+ * se rechaza igual), pero conviene rechazarlo en la capa de red también:
+ * más barato (no hay que gastar tiempo en la comparación del token) y
+ * una capa extra por si algún día el token se maneja distinto.
+ */
+fn check_origin_and_host(headers: &HeaderMap, ctx: &Ctx) -> Result<(), (StatusCode, Json<ErrorResp>)> {
+    let expected_origin = ctx.state.lock().allowed_origin.clone();
+    if let Some(origin) = headers.get(axum::http::header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if origin != expected_origin {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResp { error: "ORIGEN_NO_PERMITIDO".into(), detail: "".into() }),
+            ));
+        }
+    }
+    if let Some(host) = headers.get(axum::http::header::HOST).and_then(|v| v.to_str().ok()) {
+        let host_only = host.split(':').next().unwrap_or(host);
+        if host_only != "127.0.0.1" && host_only != "localhost" {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(ErrorResp { error: "HOST_NO_PERMITIDO".into(), detail: "".into() }),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_token(headers: &HeaderMap, ctx: &Ctx) -> Result<(), (StatusCode, Json<ErrorResp>)> {
+    check_origin_and_host(headers, ctx)?;
     let provided = headers
         .get("x-agent-token")
         .and_then(|v| v.to_str().ok())
@@ -147,10 +178,17 @@ async fn health(State(ctx): State<Ctx>, headers: HeaderMap) -> impl IntoResponse
     if let Err(e) = check_token(&headers, &ctx) {
         return e.into_response();
     }
+    // Auditoría B3: default_printer() hace una llamada Win32 síncrona —
+    // corrida directo acá, un problema del subsistema de impresión podía
+    // colgar hasta /health, el endpoint que se supone confirma que el
+    // agente sigue vivo.
+    let default_printer = tokio::task::spawn_blocking(printer_win::default_printer)
+        .await
+        .unwrap_or(None);
     Json(HealthResp {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
-        default_printer: printer_win::default_printer(),
+        default_printer,
     })
     .into_response()
 }
@@ -159,11 +197,19 @@ async fn printers(State(ctx): State<Ctx>, headers: HeaderMap) -> impl IntoRespon
     if let Err(e) = check_token(&headers, &ctx) {
         return e.into_response();
     }
-    match printer_win::list_printers() {
-        Ok(list) => Json(PrintersResp { printers: list }).into_response(),
-        Err(msg) => (
+    // Mismo motivo que en health(): EnumPrintersW es una llamada Win32
+    // síncrona (auditoría B3).
+    let result = tokio::task::spawn_blocking(printer_win::list_printers).await;
+    match result {
+        Ok(Ok(list)) => Json(PrintersResp { printers: list }).into_response(),
+        Ok(Err(msg)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResp { error: "NO_SE_PUDO_LISTAR".into(), detail: msg }),
+        )
+            .into_response(),
+        Err(join_err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResp { error: "NO_SE_PUDO_LISTAR".into(), detail: join_err.to_string() }),
         )
             .into_response(),
     }
@@ -409,24 +455,37 @@ async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): J
 
 pub async fn run(state: Arc<AppState>) {
     let port = state.lock().port;
-    let allowed_origin = state.lock().allowed_origin.clone();
-
-    let origin: HeaderValue = allowed_origin
-        .parse()
-        .unwrap_or_else(|_| HeaderValue::from_static("https://invalid.example"));
 
     // CORS ESTRICTO: un único origen exacto, nunca '*' ni un patrón amplio.
     // Como exigimos Content-Type: application/json + header custom, CUALQUIER
     // petición cross-origin dispara preflight (OPTIONS) obligatorio — una
     // página maliciosa no puede evitarlo ni leer la respuesta si su origen
     // no es exactamente este.
+    //
+    // Auditoría, hallazgo B4: antes `allowed_origin` se leía UNA vez acá y
+    // quedaba fijo en el CorsLayer para toda la vida del proceso — cambiar
+    // el origen permitido (Configuración → Agente local) exigía reiniciar
+    // el agente para que surtiera efecto. Con `AllowOrigin::predicate`, el
+    // origen se relee del estado compartido EN CADA petición — el mismo
+    // Arc<AppState> que ya usan los handlers, así que un cambio de
+    // configuración aplica de inmediato, sin reiniciar nada.
+    let state_for_cors = state.clone();
     let cors = CorsLayer::new()
-        .allow_origin(origin)
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(move |origin, _parts| {
+            let expected = state_for_cors.lock().allowed_origin.clone();
+            origin.as_bytes() == expected.as_bytes()
+        }))
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([
             axum::http::header::CONTENT_TYPE,
             axum::http::HeaderName::from_static("x-agent-token"),
-        ]);
+        ])
+        // Chrome exige esto en el preflight para que una página normal
+        // pueda hablarle a un servidor en loopback/red local (Private
+        // Network Access) — sin esto, versiones recientes de Chrome
+        // empiezan a bloquear la petición de entrada, aunque el resto de
+        // la configuración de CORS esté perfecta (auditoría B4).
+        .allow_private_network(true);
 
     let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
     let app = Router::new()
