@@ -92,6 +92,7 @@ struct PrintersResp {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // M16 (versión liviana) — ver nota en printer_win.rs::InvoiceItem
 struct PrintReq {
     // Modo térmico (existente): bytes ESC/POS ya armados en el navegador.
     #[serde(rename = "dataBase64")]
@@ -112,6 +113,7 @@ struct PrintReq {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)] // M16 (versión liviana) — ver nota en printer_win.rs::InvoiceItem
 struct PrintNetworkReq {
     #[serde(rename = "networkIp")]
     network_ip: String,
@@ -488,7 +490,31 @@ pub async fn run(state: Arc<AppState>) {
         .allow_private_network(true);
 
     let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
+    // Auditoría, hallazgo M16 (versión liviana): antes las rutas no tenían
+    // versión (`/health`, `/print`, ...) — con el sistema offline-first,
+    // una PC puede quedar con un agente viejo corriendo semanas mientras el
+    // resto ya se actualizó; sin versión en la ruta, un cambio incompatible
+    // en el contrato (agregar un campo obligatorio, cambiar un tipo) no
+    // tiene forma de convivir con el agente viejo en la misma URL. Con
+    // `/v1/...`, un cambio incompatible el día de mañana se sirve en
+    // `/v2/...` y el frontend puede seguir hablándole a `/v1/...` a las PCs
+    // que todavía no actualizaron el agente.
+    //
+    // Las rutas SIN prefijo se mantienen apuntando a los mismos handlers,
+    // como compatibilidad TEMPORAL: hoy no existe un actualizador (hallazgo
+    // B5, todavía pendiente) que reinstale el agente solo, así que forzar
+    // el corte ahora dejaría sin imprimir a cualquier PC que no se
+    // reinstale a mano el mismo día que se despliegue el frontend nuevo.
+    // Cuando B5 esté resuelto y el parque de agentes instalados ya hable
+    // `/v1` (se puede confirmar mirando qué rutas llegan a pedir en el
+    // log), estas quedan para borrar.
     let app = Router::new()
+        .route("/v1/health", get(health))
+        .route("/v1/printers", get(printers))
+        .route("/v1/print", post(print))
+        .route("/v1/print-network", post(print_network))
+        // TODO(B5): borrar estas 4 rutas una vez que el updater esté andando
+        // y el parque instalado ya haya migrado a /v1.
         .route("/health", get(health))
         .route("/printers", get(printers))
         .route("/print", post(print))

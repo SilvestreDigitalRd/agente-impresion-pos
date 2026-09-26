@@ -20,6 +20,15 @@
 use serde::Deserialize;
 
 #[derive(Deserialize, Clone)]
+// Auditoría, hallazgo M16 (versión liviana — el pipeline completo con
+// OpenAPI/typify queda pendiente para cuando el proyecto lo justifique):
+// sin esto, un campo que el frontend cambia de nombre o elimina llega acá y
+// Serde simplemente lo ignora — así se perdió `local_ticket_number` en
+// silencio (ver el campo más abajo). Con `deny_unknown_fields`, un
+// contrato desalineado entre frontend y agente falla la deserialización
+// (el handler de `/v1/print` en http_server.rs responde 422) en vez de
+// imprimir una factura con datos faltantes sin que nadie se entere.
+#[serde(deny_unknown_fields)]
 pub struct InvoiceItem {
     pub name: String,
     pub quantity: f64,
@@ -35,6 +44,7 @@ pub struct InvoiceItem {
 /// cada fila al múltiplo de 4 bytes que exige un DIB de Windows — no vuelve
 /// a decidir umbral de blanco/negro ni redimensiona la imagen origen.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M16: ver nota en InvoiceItem
 pub struct LogoRaster {
     #[serde(rename = "widthPx")]
     pub width_px: u32,
@@ -45,6 +55,7 @@ pub struct LogoRaster {
 }
 
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)] // M16: ver nota en InvoiceItem
 pub struct InvoiceDoc {
     pub business_name: String,
     pub tax_id: Option<String>,
@@ -61,6 +72,20 @@ pub struct InvoiceDoc {
     pub doc_type: String,
     pub ncf: Option<String>,
     pub items: Vec<InvoiceItem>,
+    // Auditoría, hallazgo M16 (contrato de impuestos, antes hallazgo A1):
+    // estos tres campos vienen YA CALCULADOS por el backend
+    // (invoice.service.js) siguiendo la MISMA convención que
+    // buildInvoiceDoc() en ticketFormat.js usa para armar este mismo
+    // objeto — el precio de cada línea (`InvoiceItem.unit_price`) es un
+    // precio CON ITBIS INCLUIDO, y de ahí:
+    //   tax_amount = precio_con_itbis - precio_con_itbis / (1 + tasa)
+    //   subtotal   = precio_con_itbis - tax_amount   (base imponible)
+    //   total      = subtotal + tax_amount - descuento
+    // El agente NO recalcula nada de esto — solo imprime lo que ya viene
+    // calculado. Si algún día esta convención cambia, hay que cambiarla a
+    // la vez en los tres lugares que la mencionan (acá, invoice.service.js
+    // y ticketFormat.js), porque hoy no hay un contrato único (OpenAPI)
+    // que la fije en un solo lugar — ver hallazgo M16 en la auditoría.
     pub subtotal: f64,
     pub tax_amount: f64,
     pub discount_amount: f64,
@@ -373,9 +398,32 @@ mod win {
     /// una fuente personalizada) para mantener acotada la superficie de la
     /// API de Win32 usada aquí — el resultado es más simple visualmente que
     /// el diseño del navegador, pero confiable.
+    ///
+    /// Auditoría, hallazgo M6 (corregido): antes se calculaba el alto de
+    /// página (`GetDeviceCaps(..., VERTRES)`) pero JAMÁS se comparaba contra
+    /// nada — una sola `StartPage`/`EndPage` para toda la factura, así que
+    /// una venta con muchas líneas se dibujaba fuera de la hoja física
+    /// (truncada, sin totales ni pie). Ahora:
+    ///   1. El encabezado (logo + datos del negocio + datos del comprobante)
+    ///      se armó como closure (`draw_page_header`) para poder repetirlo
+    ///      igual en cada página nueva.
+    ///   2. `ensure_space` compara la posición actual contra el alto real de
+    ///      la página (con margen inferior) antes de dibujar cada bloque; si
+    ///      no alcanza, hace `EndPage`/`StartPage` y vuelve a dibujar el
+    ///      encabezado antes de seguir.
+    ///   3. El bloque final (Subtotal/ITBIS/Descuento/TOTAL/pago/pie) se
+    ///      reserva como una unidad ANTES de dibujar el último renglón que
+    ///      cupiera — así nunca queda un renglón de producto en una página y
+    ///      el total solo en la siguiente, ni el pie cortado a la mitad.
+    ///   4. Nombres de producto, dirección del negocio y pie de página pasan
+    ///      por `wrap_text` (medido con `GetTextExtentPoint32W`, la misma
+    ///      fuente por defecto que ya usa `draw`) — un nombre largo ahora
+    ///      ocupa varias líneas en vez de salirse del ancho de la hoja.
     pub fn print_a4_document(printer_name: &str, paper_size: &str, invoice: &InvoiceDoc) -> Result<(), String> {
+        use windows::Win32::Foundation::SIZE;
         use windows::Win32::Graphics::Gdi::{
-            CreateDCW, DeleteDC, LineTo, MoveToEx, TextOutW, GetDeviceCaps, GET_DEVICE_CAPS_INDEX,
+            CreateDCW, DeleteDC, LineTo, MoveToEx, TextOutW, GetDeviceCaps, GetTextExtentPoint32W,
+            GET_DEVICE_CAPS_INDEX, HDC,
         };
         // StartDocW/EndDoc/StartPage/EndPage/DOCINFOW viven en Storage::Xps
         // en esta versión del crate, no en Graphics::Gdi (confirmado por el
@@ -408,12 +456,15 @@ mod win {
             let px_x = GetDeviceCaps(hdc, LOGPIXELSX) as f64 / 25.4; // píxeles por mm (horizontal)
             let px_y = GetDeviceCaps(hdc, LOGPIXELSY) as f64 / 25.4; // píxeles por mm (vertical)
             let page_w = GetDeviceCaps(hdc, HORZRES) as f64;
-            let _page_h = GetDeviceCaps(hdc, VERTRES) as f64;
+            // M6: antes `_page_h` (con guion bajo — Rust ya avisaba que no se
+            // usaba en ningún lado). Ahora sí se usa, en `ensure_space`.
+            let page_h = GetDeviceCaps(hdc, VERTRES) as f64;
             let _ = paper_size; // el tamaño real lo define la bandeja/config ya establecida en el driver de Windows
 
-            let margin = 12.0 * px_x; // ~12mm de margen
+            let margin = 12.0 * px_x; // ~12mm de margen — se reutiliza como margen inferior también, igual que ya hacía el código original al usarlo como "y" inicial
             let line_h = 5.5 * px_y;  // alto de línea aproximado
             let col2 = page_w - margin - (55.0 * px_x); // columna derecha (montos)
+            let content_width = page_w - margin * 2.0; // ancho disponible para texto (para word-wrap)
 
             let doc_name = to_wide("Factura");
             let doc_info = DOCINFOW {
@@ -434,62 +485,162 @@ mod win {
                 return Err("No se pudo iniciar la página de impresión.".into());
             }
 
-            let mut y = margin;
-
-            // Logo (si el negocio tiene uno configurado) — bitmap ya armado
-            // por el navegador, dibujado vía GDI antes que el resto del
-            // texto. Un logo roto o que no dibuja nunca debe bloquear la
-            // impresión de la factura (mismo criterio que térmica/red).
-            if let Some(logo) = &invoice.logo {
-                let logo_w = (page_w - margin * 2.0) * 0.35; // banner discreto, no domina la hoja
-                let logo_x = margin + ((page_w - margin * 2.0) - logo_w) / 2.0; // centrado
-                match draw_logo(hdc, logo_x as i32, y as i32, logo_w as i32, logo) {
-                    Ok(drawn_h) => y += drawn_h as f64 + line_h * 0.5,
-                    Err(_) => { /* logo roto: se sigue sin él, no se aborta la impresión */ }
-                }
-            }
-
-            let draw = |hdc: windows::Win32::Graphics::Gdi::HDC, x: f64, y: f64, text: &str| {
+            let draw = |hdc: HDC, x: f64, y: f64, text: &str| {
                 let wide = to_wide(text);
                 let _ = TextOutW(hdc, x as i32, y as i32, &wide[..wide.len().saturating_sub(1)]);
             };
-            let divider = |hdc: windows::Win32::Graphics::Gdi::HDC, y: f64| {
+            let divider = |hdc: HDC, y: f64| {
                 let mut prev = windows::Win32::Foundation::POINT::default();
                 let _ = MoveToEx(hdc, margin as i32, y as i32, Some(&mut prev));
                 let _ = LineTo(hdc, (page_w - margin) as i32, y as i32);
             };
 
-            draw(hdc, margin, y, &invoice.business_name);
-            y += line_h;
-            if let Some(t) = &invoice.tax_id { draw(hdc, margin, y, &format!("RNC: {t}")); y += line_h; }
-            if let Some(a) = &invoice.business_address { draw(hdc, margin, y, a); y += line_h; }
-            if let Some(p) = &invoice.business_phone { draw(hdc, margin, y, &format!("Tel: {p}")); y += line_h; }
-            y += line_h * 0.4;
-            divider(hdc, y);
-            y += line_h;
-
-            draw(hdc, margin, y, &format!("Fecha: {}", invoice.created_at)); y += line_h;
-            if let Some(n) = &invoice.local_ticket_number { draw(hdc, margin, y, n); y += line_h; }
-            draw(hdc, margin, y, &format!("Atendido por: {}", invoice.cashier_name)); y += line_h;
-            if let Some(c) = &invoice.customer_name { draw(hdc, margin, y, &format!("Cliente: {c}")); y += line_h; }
-            let doc_type_line = if invoice.doc_type == "fiscal" {
-                format!("NCF: {}", invoice.ncf.as_deref().unwrap_or("—"))
-            } else {
-                "Ticket de venta (sin valor fiscal)".to_string()
+            // M6, punto 8: ancho de texto real vía GetTextExtentPoint32W —
+            // mismo criterio de medición que usa cualquier programa de
+            // Windows, con la fuente por defecto ya seleccionada en el DC
+            // (la misma que usa `draw`/TextOutW, no se cambia ninguna fuente
+            // a propósito, ver comentario de la función).
+            let measure_width = |hdc: HDC, text: &str| -> f64 {
+                let wide = to_wide(text);
+                let slice = &wide[..wide.len().saturating_sub(1)];
+                let mut size = SIZE::default();
+                if GetTextExtentPoint32W(hdc, slice, &mut size).as_bool() {
+                    size.cx as f64
+                } else {
+                    0.0 // no se pudo medir: se sigue de largo sin envolver esa línea, no se aborta la impresión
+                }
             };
-            draw(hdc, margin, y, &doc_type_line);
-            y += line_h;
-            divider(hdc, y);
-            y += line_h * 1.2;
+            // Envuelve por palabra (sin cortar una palabra sola que ya
+            // exceda el ancho — sería más código para un caso raro; una
+            // palabra suelta larguísima simplemente se sale un poco, igual
+            // que antes, pero deja de pasar con nombres de producto normales
+            // como "Coca Cola botella retornable 2.5 litros...").
+            let wrap_text = |hdc: HDC, text: &str, max_width: f64| -> Vec<String> {
+                let mut lines: Vec<String> = Vec::new();
+                let mut current = String::new();
+                for word in text.split_whitespace() {
+                    let candidate = if current.is_empty() { word.to_string() } else { format!("{current} {word}") };
+                    if !current.is_empty() && measure_width(hdc, &candidate) > max_width {
+                        lines.push(current);
+                        current = word.to_string();
+                    } else {
+                        current = candidate;
+                    }
+                }
+                if !current.is_empty() {
+                    lines.push(current);
+                }
+                lines
+            };
+
+            // M6, puntos 6-7: encabezado extraído a closure para poder
+            // repetirlo igual en cada página nueva — antes vivía mezclado
+            // en medio de la función y solo se dibujaba una vez.
+            let draw_page_header = |hdc: HDC, y: &mut f64| {
+                // Logo (si el negocio tiene uno configurado) — bitmap ya
+                // armado por el navegador. Un logo roto o que no dibuja
+                // nunca debe bloquear la impresión (mismo criterio que
+                // térmica/red).
+                if let Some(logo) = &invoice.logo {
+                    let logo_w = content_width * 0.35; // banner discreto, no domina la hoja
+                    let logo_x = margin + (content_width - logo_w) / 2.0; // centrado
+                    match draw_logo(hdc, logo_x as i32, *y as i32, logo_w as i32, logo) {
+                        Ok(drawn_h) => *y += drawn_h as f64 + line_h * 0.5,
+                        Err(_) => { /* logo roto: se sigue sin él, no se aborta la impresión */ }
+                    }
+                }
+
+                draw(hdc, margin, *y, &invoice.business_name);
+                *y += line_h;
+                if let Some(t) = &invoice.tax_id { draw(hdc, margin, *y, &format!("RNC: {t}")); *y += line_h; }
+                if let Some(a) = &invoice.business_address {
+                    for line in wrap_text(hdc, a, content_width) { draw(hdc, margin, *y, &line); *y += line_h; }
+                }
+                if let Some(p) = &invoice.business_phone { draw(hdc, margin, *y, &format!("Tel: {p}")); *y += line_h; }
+                *y += line_h * 0.4;
+                divider(hdc, *y);
+                *y += line_h;
+
+                draw(hdc, margin, *y, &format!("Fecha: {}", invoice.created_at)); *y += line_h;
+                if let Some(n) = &invoice.local_ticket_number { draw(hdc, margin, *y, n); *y += line_h; }
+                draw(hdc, margin, *y, &format!("Atendido por: {}", invoice.cashier_name)); *y += line_h;
+                if let Some(c) = &invoice.customer_name { draw(hdc, margin, *y, &format!("Cliente: {c}")); *y += line_h; }
+                let doc_type_line = if invoice.doc_type == "fiscal" {
+                    format!("NCF: {}", invoice.ncf.as_deref().unwrap_or("—"))
+                } else {
+                    "Ticket de venta (sin valor fiscal)".to_string()
+                };
+                draw(hdc, margin, *y, &doc_type_line);
+                *y += line_h;
+                divider(hdc, *y);
+                *y += line_h * 1.2;
+            };
+
+            let mut y = margin;
+            draw_page_header(hdc, &mut y);
+
+            // M6, punto 6: garantiza que quepan `required` unidades de alto
+            // antes de seguir dibujando — si no, cierra la página actual,
+            // abre una nueva y vuelve a dibujar el encabezado antes de
+            // continuar. `margin` hace de margen inferior también, igual
+            // que ya lo usaba el código original como margen superior/`y`
+            // inicial.
+            let ensure_space = |hdc: HDC, y: &mut f64, required: f64| -> Result<(), String> {
+                if *y + required > page_h - margin {
+                    if EndPage(hdc) <= 0 {
+                        return Err("No se pudo cerrar la página para pasar a la siguiente.".into());
+                    }
+                    if StartPage(hdc) <= 0 {
+                        return Err("No se pudo iniciar una nueva página.".into());
+                    }
+                    *y = margin;
+                    draw_page_header(hdc, y);
+                }
+                Ok(())
+            };
 
             for item in &invoice.items {
-                draw(hdc, margin, y, &item.name);
-                y += line_h;
-                let line = format!("  {} x {}", item.quantity, money(item.unit_price));
-                draw(hdc, margin, y, &line);
+                let name_lines = wrap_text(hdc, &item.name, content_width);
+                let name_line_count = name_lines.len().max(1) as f64;
+                // Alto que ocupa ESTE renglón completo (nombre, tal vez en
+                // varias líneas, + la línea de cantidad/precio) — se mide
+                // ANTES de dibujar nada, para poder decidir si hace falta
+                // saltar de página primero.
+                let item_h = line_h * name_line_count + line_h * 1.1;
+                ensure_space(hdc, &mut y, item_h)?;
+
+                if name_lines.is_empty() {
+                    draw(hdc, margin, y, &item.name);
+                    y += line_h;
+                } else {
+                    for line in &name_lines {
+                        draw(hdc, margin, y, line);
+                        y += line_h;
+                    }
+                }
+                let qty_line = format!("  {} x {}", item.quantity, money(item.unit_price));
+                draw(hdc, margin, y, &qty_line);
                 draw(hdc, col2, y, &money(item.quantity * item.unit_price));
                 y += line_h * 1.1;
             }
+
+            // M6, punto 6 (la parte que evita el caso peor): el bloque final
+            // se reserva COMPLETO de una vez — divisor + subtotal + ITBIS +
+            // (descuento) + TOTAL + método de pago + pie — antes de dibujar
+            // el primer renglón de esta sección. Así nunca queda el TOTAL
+            // solo en una página nueva mientras el último producto quedó en
+            // la anterior.
+            let footer_lines = invoice.footer.as_deref()
+                .map(|f| wrap_text(hdc, f, content_width))
+                .unwrap_or_default();
+            let footer_reserved =
+                line_h                                                    // divisor
+                + line_h * 2.0                                            // Subtotal + ITBIS
+                + if invoice.discount_amount > 0.0 { line_h } else { 0.0 } // Descuento (si aplica)
+                + line_h * 1.3                                            // TOTAL
+                + line_h * 1.5                                            // Método de pago
+                + line_h * footer_lines.len() as f64;                     // pie (si lo hay)
+            ensure_space(hdc, &mut y, footer_reserved)?;
 
             divider(hdc, y);
             y += line_h;
@@ -502,7 +653,10 @@ mod win {
             draw(hdc, margin, y, &format!("Método de pago: {}", invoice.payment_method));
             y += line_h * 1.5;
 
-            if let Some(f) = &invoice.footer { draw(hdc, margin, y, f); }
+            for line in &footer_lines {
+                draw(hdc, margin, y, line);
+                y += line_h;
+            }
 
             let _ = EndPage(hdc);
             let _ = EndDoc(hdc);
