@@ -1,12 +1,26 @@
 name: Build agente de impresión (Windows)
 
+# Antes: solo `push: branches: [main]` + workflow_dispatch — ninguno de
+# los dos produce jamás una ref `refs/tags/...`, así que el paso
+# "Publicar Release automático" (con `if: startsWith(github.ref,
+# 'refs/tags/')`) nunca se ejecutaba. Ahora: un push de un tag `v*` SÍ
+# dispara el job de release; un push normal a `main` sigue disparando
+# solo el build de depuración (chequeo rápido de que compila, sin tocar
+# ningún Release).
 on:
   push:
     branches: [main]
+    tags:
+      - "v*"
   workflow_dispatch: {}
 
 jobs:
-  build:
+  release:
+    # Solo corre cuando el push fue de un tag (v1.0.0, v1.0.1, ...) — nunca
+    # en un push común a main ni en un workflow_dispatch manual sin tag.
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write # tauri-action necesita esto para crear/editar el Release
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,25 +28,39 @@ jobs:
       - name: Instalar Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Instalar Tauri CLI
-        run: cargo install tauri-cli --version "^2"
-
-      - name: Compilar instalador (.msi y .exe)
-        run: cargo tauri build
+      # Reemplaza "cargo tauri build" + softprops/action-gh-release: arma
+      # el build Y genera/sube el `latest.json` que tauri.conf.json espera
+      # en plugins.updater.endpoints (formato JSON exacto que el plugin
+      # necesita: version, notes, pub_date, platforms.windows-x86_64.{url,
+      # signature}) — el workflow anterior no lo generaba, así que el
+      # updater de B5 nunca iba a encontrar una actualización aunque el
+      # build y el release salieran perfectos.
+      - name: Compilar y publicar el release firmado
+        uses: tauri-apps/tauri-action@v0
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-
-      - name: Subir instaladores como artefacto
-        uses: actions/upload-artifact@v4
         with:
-          name: agente-impresion-instaladores
-          path: |
-            src-tauri/target/release/bundle/msi/*.msi
-            src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/nsis/*.sig
+          # github.ref_name en un push de tag YA es el nombre del tag
+          # (ej. "v1.0.1") — no hace falta generarlo desde __VERSION__
+          # porque acá el tag lo creaste vos a mano (ver LEEME), no la
+          # acción.
+          tagName: ${{ github.ref_name }}
+          releaseName: "Agente de impresión ${{ github.ref_name }}"
+          releaseBody: "Ver los archivos adjuntos para instalar. Un agente ya instalado se actualiza solo."
+          # Draft a propósito: revisá las notas del release y confirmá que
+          # el build esté bien ANTES de publicarlo a mano — recién ahí
+          # queda visible en /releases/latest/, que es lo que consulta el
+          # updater. Un release en draft es invisible para el endpoint.
+          releaseDraft: true
+          uploadUpdaterJson: true
 
   build-debug:
+    # Chequeo rápido de que compila en cada push a main — nunca toca
+    # ningún Release ni sube nada firmado. No corre en un push de tag (ese
+    # caso ya lo cubre el build real de arriba).
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
