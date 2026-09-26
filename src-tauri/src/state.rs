@@ -157,7 +157,53 @@ pub fn tokens_match(provided: &str, expected: &str) -> bool {
     len_matches & content_matches
 }
 
-pub struct AppState(pub Mutex<AgentConfig>);
+pub struct AppState {
+    config: Mutex<AgentConfig>,
+    // Auditoría, hallazgo B5: el actualizador nunca debe instalar a media
+    // impresión — este contador (incrementado/decrementado por
+    // `ActivePrintGuard`, ver más abajo) es lo que consulta
+    // `install_agent_update` (en updater.rs) antes de descargar e instalar.
+    // Vive acá (no en http_server.rs) porque tanto el servidor HTTP como
+    // el comando de Tauri del updater necesitan verlo, y los dos ya
+    // comparten este mismo `Arc<AppState>`.
+    pub active_prints: std::sync::atomic::AtomicUsize,
+}
+
+impl AppState {
+    pub fn new(config: AgentConfig) -> Self {
+        Self {
+            config: Mutex::new(config),
+            active_prints: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+/// RAII (auditoría, hallazgo B5 — mismo criterio que `PrinterHandleGuard`
+/// en printer_win.rs para el HANDLE de impresora): se crea justo antes de
+/// empezar a imprimir de verdad y se mantiene viva hasta el final de la
+/// función que la creó, así que decrementa el contador SIEMPRE que esa
+/// función retorna — éxito, error, pánico capturado por `spawn_blocking`,
+/// o el camino de timeout que corta la espera sin cancelar el hilo de
+/// fondo (ver comentario en http_server.rs::print). Sin esto, ese camino
+/// de timeout dejaría el contador incrementado para siempre y el
+/// actualizador nunca instalaría nada, creyendo que siempre hay una
+/// impresión en curso.
+pub struct ActivePrintGuard<'a> {
+    state: &'a AppState,
+}
+
+impl<'a> ActivePrintGuard<'a> {
+    pub fn new(state: &'a AppState) -> Self {
+        state.active_prints.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { state }
+    }
+}
+
+impl<'a> Drop for ActivePrintGuard<'a> {
+    fn drop(&mut self) {
+        self.state.active_prints.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
 
 impl AppState {
     /// Lock que nunca se envenena. Antes, todo acceso usaba
@@ -170,7 +216,7 @@ impl AppState {
     /// pánico no corrompe los datos ya escritos) y se sigue, dejando un
     /// aviso en el log para poder investigar después.
     pub fn lock(&self) -> std::sync::MutexGuard<'_, AgentConfig> {
-        self.0.lock().unwrap_or_else(|poisoned| {
+        self.config.lock().unwrap_or_else(|poisoned| {
             eprintln!("AVISO: se recuperó el estado del agente después de un error interno (mutex envenenado) — revisar el log de arriba para la causa.");
             poisoned.into_inner()
         })

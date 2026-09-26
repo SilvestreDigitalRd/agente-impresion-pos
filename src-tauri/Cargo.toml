@@ -10,6 +10,12 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2"
+# Auditoría, hallazgo B5: el actualizador firmado del agente. La firma del
+# PAQUETE de actualización es obligatoria en Tauri y no se puede
+# desactivar (distinto de un certificado Authenticode de Windows, que es
+# aparte y no es requisito para que esto funcione) — ver el comentario
+# largo en src/updater.rs para el diseño completo.
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }

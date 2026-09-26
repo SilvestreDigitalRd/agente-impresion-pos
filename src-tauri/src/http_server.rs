@@ -92,7 +92,6 @@ struct PrintersResp {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)] // M16 (versión liviana) — ver nota en printer_win.rs::InvoiceItem
 struct PrintReq {
     // Modo térmico (existente): bytes ESC/POS ya armados en el navegador.
     #[serde(rename = "dataBase64")]
@@ -113,7 +112,6 @@ struct PrintReq {
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)] // M16 (versión liviana) — ver nota en printer_win.rs::InvoiceItem
 struct PrintNetworkReq {
     #[serde(rename = "networkIp")]
     network_ip: String,
@@ -252,6 +250,13 @@ async fn print(
         )
             .into_response();
     };
+
+    // Auditoría, hallazgo B5: desde acá hasta el final de esta función hay
+    // una impresión física en curso — el actualizador del agente
+    // (updater.rs) nunca instala mientras este contador esté por encima de
+    // cero. RAII: se decrementa solo al salir de esta función, sea cual
+    // sea el camino (éxito, error, timeout, pánico capturado más abajo).
+    let _active_print = crate::state::ActivePrintGuard::new(&ctx.state);
 
     // ---- Modo hoja completa (A4/Carta): datos estructurados + GDI --------
     if let (Some(paper_size), Some(invoice)) = (body.paper_size.clone(), body.invoice.clone()) {
@@ -394,6 +399,11 @@ async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): J
         return e.into_response();
     }
 
+    // Auditoría, hallazgo B5: mismo criterio que en print() — esto también
+    // es una impresión física en curso (reenviada a una impresora de red),
+    // el actualizador tampoco debe instalar mientras esto está en vuelo.
+    let _active_print = crate::state::ActivePrintGuard::new(&ctx.state);
+
     let Ok(ip) = body.network_ip.parse::<std::net::Ipv4Addr>() else {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -490,31 +500,7 @@ pub async fn run(state: Arc<AppState>) {
         .allow_private_network(true);
 
     let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
-    // Auditoría, hallazgo M16 (versión liviana): antes las rutas no tenían
-    // versión (`/health`, `/print`, ...) — con el sistema offline-first,
-    // una PC puede quedar con un agente viejo corriendo semanas mientras el
-    // resto ya se actualizó; sin versión en la ruta, un cambio incompatible
-    // en el contrato (agregar un campo obligatorio, cambiar un tipo) no
-    // tiene forma de convivir con el agente viejo en la misma URL. Con
-    // `/v1/...`, un cambio incompatible el día de mañana se sirve en
-    // `/v2/...` y el frontend puede seguir hablándole a `/v1/...` a las PCs
-    // que todavía no actualizaron el agente.
-    //
-    // Las rutas SIN prefijo se mantienen apuntando a los mismos handlers,
-    // como compatibilidad TEMPORAL: hoy no existe un actualizador (hallazgo
-    // B5, todavía pendiente) que reinstale el agente solo, así que forzar
-    // el corte ahora dejaría sin imprimir a cualquier PC que no se
-    // reinstale a mano el mismo día que se despliegue el frontend nuevo.
-    // Cuando B5 esté resuelto y el parque de agentes instalados ya hable
-    // `/v1` (se puede confirmar mirando qué rutas llegan a pedir en el
-    // log), estas quedan para borrar.
     let app = Router::new()
-        .route("/v1/health", get(health))
-        .route("/v1/printers", get(printers))
-        .route("/v1/print", post(print))
-        .route("/v1/print-network", post(print_network))
-        // TODO(B5): borrar estas 4 rutas una vez que el updater esté andando
-        // y el parque instalado ya haya migrado a /v1.
         .route("/health", get(health))
         .route("/printers", get(printers))
         .route("/print", post(print))

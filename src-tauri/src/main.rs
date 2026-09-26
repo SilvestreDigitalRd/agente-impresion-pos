@@ -5,12 +5,14 @@
 mod http_server;
 mod printer_win;
 mod state;
+mod updater;
 
 use state::{AgentConfig, AppState};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State as TauriState};
+use updater::PendingUpdate;
 
 // Ícono de la bandeja, incrustado en el binario en tiempo de COMPILACIÓN
 // (no en tiempo de ejecución) — si el archivo estuviera corrupto, el build
@@ -26,6 +28,7 @@ struct StatusPayload {
     port: u16,
     default_printer: Option<String>,
     autostart: bool,
+    agent_version: &'static str,
 }
 
 #[tauri::command]
@@ -37,6 +40,7 @@ fn get_status(state: TauriState<Arc<AppState>>) -> StatusPayload {
         port: cfg.port,
         default_printer: cfg.default_printer.clone().or_else(printer_win::default_printer),
         autostart: cfg.autostart,
+        agent_version: env!("CARGO_PKG_VERSION"),
     }
 }
 
@@ -88,7 +92,7 @@ fn main() {
     let config = AgentConfig::load_or_create();
     crate::state::log_line(&format!("Agente iniciado — versión {}", env!("CARGO_PKG_VERSION")));
     let initial_autostart = config.autostart;
-    let shared = Arc::new(AppState(Mutex::new(config)));
+    let shared = Arc::new(AppState::new(config));
     let http_state = shared.clone();
 
     tauri::Builder::default()
@@ -96,12 +100,21 @@ fn main() {
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
         ))
+        // Auditoría, hallazgo B5: el plugin SOLO se registra acá — el
+        // WebView no tiene ningún permiso `updater:*` en
+        // capabilities/default.json (no hacía falta agregarlo: los
+        // comandos de abajo son comandos de app comunes, no del plugin).
+        // Ver el comentario largo en updater.rs para el porqué completo.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(shared)
+        .manage(PendingUpdate::default())
         .invoke_handler(tauri::generate_handler![
             get_status,
             regenerate_token,
             list_printers_cmd,
-            save_settings
+            save_settings,
+            updater::check_agent_update,
+            updater::install_agent_update
         ])
         .setup(move |app| {
             // Sincroniza el registro REAL de Windows con lo que dice
@@ -121,11 +134,19 @@ fn main() {
             // Servidor HTTP en un hilo async separado — nunca bloquea la UI.
             tauri::async_runtime::spawn(http_server::run(http_state));
 
+            // Auditoría, hallazgo B5: chequeo automático de actualización —
+            // al arrancar (con demora corta) y cada 6 horas. Ver el
+            // comentario largo en updater.rs — nunca bloquea ni exige
+            // Internet para que el agente funcione.
+            updater::spawn_periodic_check(app.handle().clone());
+
             // Ícono de bandeja: clic izquierdo abre/oculta la ventana de
-            // configuración; clic derecho da acceso a "Salir".
+            // configuración; clic derecho da acceso a "Buscar
+            // actualización" y "Salir".
             let show_i = MenuItem::with_id(app, "show", "Configuración…", true, None::<&str>)?;
+            let check_update_i = MenuItem::with_id(app, "check_update", "Buscar actualización", true, None::<&str>)?;
             let quit_i = MenuItem::with_id(app, "quit", "Salir", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show_i, &quit_i])?;
+            let menu = Menu::with_items(app, &[&show_i, &check_update_i, &quit_i])?;
 
             let _tray = TrayIconBuilder::new()
                 .icon(TRAY_ICON)
@@ -136,6 +157,19 @@ fn main() {
                         if let Some(w) = app.get_webview_window("settings") {
                             w.show().ok();
                             w.set_focus().ok();
+                        }
+                    }
+                    // Abre la ventana de configuración (misma que
+                    // "Configuración…") y le pide al frontend que arranque
+                    // el chequeo — así el cajero VE el resultado (versión
+                    // actual, si hay una nueva, progreso de instalación) en
+                    // vez de que pase en silencio en la bandeja sin que
+                    // nadie se entere de si funcionó o no.
+                    "check_update" => {
+                        if let Some(w) = app.get_webview_window("settings") {
+                            w.show().ok();
+                            w.set_focus().ok();
+                            let _ = w.eval("window.__checkAgentUpdateFromTray && window.__checkAgentUpdateFromTray()");
                         }
                     }
                     "quit" => app.exit(0),

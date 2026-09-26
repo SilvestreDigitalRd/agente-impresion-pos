@@ -32,6 +32,7 @@
       "msi",
       "nsis"
     ],
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -41,6 +42,17 @@
     "windows": {
       "webviewInstallMode": {
         "type": "downloadBootstrapper"
+      }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFFODg5MDU2ODczNTZGRDIKUldUU2J6V0hWcENJcm96WDl0QkRIdTl5VU52ZHZURXBYR2p0T1NVUk5MUExGZnlmVzVkendLWk0K",
+      "endpoints": [
+        "https://github.com/SilvestreDigitalRd/agente-impresion-pos/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
       }
     }
   }

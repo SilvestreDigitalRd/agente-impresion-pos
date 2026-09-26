@@ -1,14 +1,19 @@
 // Este archivo SOLO llama a comandos de Rust definidos a medida
-// (get_status, regenerate_token, list_printers_cmd, save_settings).
-// No usa fs, shell, dialog ni ningún plugin genérico de Tauri — no tiene
-// permisos para ello (ver src-tauri/capabilities/default.json).
-const { invoke } = window.__TAURI__.core;
+// (get_status, regenerate_token, list_printers_cmd, save_settings,
+// check_agent_update, install_agent_update). No usa fs, shell, dialog ni
+// ningún plugin genérico de Tauri — no tiene permisos para ello (ver
+// src-tauri/capabilities/default.json). Los dos comandos de actualización
+// tampoco están detrás de un permiso `updater:*`: son comandos de app
+// comunes, iguales a los demás — el plugin del updater se usa SOLO desde
+// Rust (ver updater.rs).
+const { invoke, Channel } = window.__TAURI__.core;
 
 async function loadStatus() {
   const s = await invoke('get_status');
   document.getElementById('token').value = s.pairing_token;
   document.getElementById('origin').value = s.allowed_origin;
   document.getElementById('autostart').checked = s.autostart;
+  document.getElementById('agentVersion').textContent = s.agent_version;
   await loadPrinters(s.default_printer);
 }
 
@@ -59,5 +64,69 @@ document.getElementById('save').addEventListener('click', async () => {
   msg.textContent = 'Guardado ✔ (si cambiaste el origen permitido, reinicia el agente para aplicarlo)';
   setTimeout(() => (msg.textContent = ''), 4000);
 });
+
+/**
+ * Auditoría, hallazgo B5. Comprueba si hay una versión más nueva y, si la
+ * hay, instala directo (mismo comportamiento que el chequeo automático en
+ * segundo plano — ver spawn_periodic_check en updater.rs — la diferencia
+ * es que ACÁ el cajero ve el progreso en esta ventana). Si hay una
+ * impresión en curso en ese momento, `install_agent_update` lo rechaza
+ * con "PRINT_IN_PROGRESS" y se lo avisamos en vez de reintentar solos.
+ */
+async function checkForUpdate() {
+  const msg = document.getElementById('updateMsg');
+  const btn = document.getElementById('checkUpdate');
+  btn.disabled = true;
+  msg.textContent = 'Buscando actualización…';
+  try {
+    const status = await invoke('check_agent_update');
+    if (!status.available) {
+      msg.textContent = 'Ya tenés la última versión.';
+      setTimeout(() => (msg.textContent = ''), 4000);
+      return;
+    }
+    msg.textContent = `Versión ${status.version} disponible — descargando…`;
+    await installUpdate(msg);
+  } catch (e) {
+    msg.textContent = `No se pudo comprobar actualización: ${e}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function installUpdate(msg) {
+  // Channel: forma que expone Tauri para recibir eventos de progreso de un
+  // comando de Rust de larga duración — ver InstallProgress en updater.rs.
+  const onEvent = new Channel();
+  onEvent.onmessage = (progress) => {
+    if (progress.phase === 'downloading') {
+      const pct = progress.total ? Math.round((progress.downloaded / progress.total) * 100) : null;
+      msg.textContent = pct != null
+        ? `Descargando actualización… ${pct}%`
+        : `Descargando actualización… (${progress.downloaded} bytes)`;
+    } else if (progress.phase === 'installing') {
+      msg.textContent = 'Instalando — el agente se va a reiniciar solo en unos segundos.';
+    }
+  };
+  try {
+    await invoke('install_agent_update', { onEvent });
+    msg.textContent = 'Actualización instalada — el agente se está reiniciando…';
+  } catch (e) {
+    if (e === 'PRINT_IN_PROGRESS') {
+      msg.textContent = 'Hay una impresión en curso justo ahora — probá de nuevo en un momento.';
+    } else {
+      msg.textContent = `No se pudo instalar la actualización: ${e}`;
+    }
+  }
+}
+
+document.getElementById('checkUpdate').addEventListener('click', checkForUpdate);
+
+// Llamado desde Rust cuando se toca "Buscar actualización" en el menú de
+// la bandeja (ver on_menu_event en main.rs, que hace w.eval(...) contra
+// esto) — el clic llegó del lado del menú nativo, no de este WebView, pero
+// de acá en adelante el flujo es exactamente el mismo que tocar el botón
+// de esta ventana.
+window.__checkAgentUpdateFromTray = checkForUpdate;
 
 loadStatus();
