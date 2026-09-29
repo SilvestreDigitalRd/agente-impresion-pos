@@ -500,6 +500,18 @@ pub async fn run(state: Arc<AppState>) {
 
     let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
     let app = Router::new()
+        // Auditoría, hallazgo M16: contrato versionado bajo /v1 — esto se había
+        // documentado y aplicado en los structs (deny_unknown_fields, ver arriba)
+        // pero se había quedado afuera acá, en el router, por un merge parcial de
+        // esa entrega. El frontend (print.js) ya llama a /v1/health, /v1/print y
+        // /v1/print-network desde esa misma ronda — sin estas rutas, cualquier
+        // agente en producción responde 404 a todo lo que la app web le pide.
+        .route("/v1/health", get(health))
+        .route("/v1/printers", get(printers))
+        .route("/v1/print", post(print))
+        .route("/v1/print-network", post(print_network))
+        // TODO(B5): borrar estas 4 rutas sin prefijo una vez que el updater esté
+        // andando en producción y ya no haya agentes viejos hablando sin /v1.
         .route("/health", get(health))
         .route("/printers", get(printers))
         .route("/print", post(print))
