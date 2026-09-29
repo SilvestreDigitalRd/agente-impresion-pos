@@ -56,13 +56,26 @@ document.getElementById('regenToken').addEventListener('click', async () => {
 document.getElementById('refreshPrinters').addEventListener('click', () => loadPrinters());
 
 document.getElementById('save').addEventListener('click', async () => {
+  const msg = document.getElementById('saveMsg');
   const allowed_origin = document.getElementById('origin').value.trim();
   const default_printer = document.getElementById('printerSelect').value || null;
   const autostart = document.getElementById('autostart').checked;
-  await invoke('save_settings', { allowedOrigin: allowed_origin, defaultPrinter: default_printer, autostart });
-  const msg = document.getElementById('saveMsg');
-  msg.textContent = 'Guardado ✔ (si cambiaste el origen permitido, reinicia el agente para aplicarlo)';
-  setTimeout(() => (msg.textContent = ''), 4000);
+  try {
+    // save_settings ahora devuelve Option<String>: null si todo salió bien,
+    // o un aviso si autostart falló pero el resto (impresora/origen) SÍ se
+    // guardó igual (antes un error de autostart perdía todo el cambio en
+    // silencio — ver la nota larga en main.rs).
+    const autostartWarning = await invoke('save_settings', { allowedOrigin: allowed_origin, defaultPrinter: default_printer, autostart });
+    msg.textContent = autostartWarning
+      ? `Guardado ✔ — impresora y origen aplicados. ${autostartWarning}`
+      : 'Guardado ✔ (si cambiaste el origen permitido, reinicia el agente para aplicarlo)';
+  } catch (e) {
+    // Antes: sin try/catch, esto quedaba como una promesa rechazada sin
+    // manejar — el botón "no hacía nada" porque el error nunca llegaba a
+    // ningún lado visible.
+    msg.textContent = `No se pudo guardar: ${e}`;
+  }
+  setTimeout(() => (msg.textContent = ''), 6000);
 });
 
 /**

@@ -63,17 +63,22 @@ fn save_settings(
     allowed_origin: String,
     default_printer: Option<String>,
     autostart: bool,
-) -> Result<(), String> {
-    // Antes esta función SOLO guardaba `autostart` en config.json — nunca
-    // llamaba al plugin, así que tildar/destildar "Iniciar con Windows" no
-    // hacía nada de verdad en el sistema operativo (el plugin quedaba
-    // registrado pero jamás se invocaba enable()/disable()). Se corrige
-    // acá: el checkbox ahora sí prende/apaga el registro real de Windows,
-    // antes de guardar la preferencia.
+) -> Result<Option<String>, String> {
+    // Antes esta función encadenaba con `?`: si `enable()`/`disable()` del
+    // plugin de autostart fallaba por CUALQUIER motivo (la app corriendo sin
+    // instalar del todo, permisos del registro de Windows, etc.), la función
+    // cortaba ahí mismo y `cfg.save()` nunca se ejecutaba — el cambio de
+    // impresora u origen que el usuario acababa de hacer se perdía en
+    // silencio, sin relación alguna con el checkbox de autostart. Ahora: se
+    // INTENTA sincronizar autostart, pero si falla no bloquea nada más — el
+    // resto de la configuración se guarda igual, y el fallo de autostart se
+    // devuelve aparte como aviso (Some(mensaje)) en vez de perderse todo.
     use tauri_plugin_autostart::ManagerExt;
     let autolaunch = app.autolaunch();
     let sync_result = if autostart { autolaunch.enable() } else { autolaunch.disable() };
-    sync_result.map_err(|e| format!("No se pudo actualizar el inicio automático de Windows: {e}"))?;
+    let autostart_warning = sync_result
+        .err()
+        .map(|e| format!("No se pudo actualizar el inicio automático de Windows: {e}"));
 
     // El puerto NO se puede cambiar en caliente sin reiniciar el servidor
     // (queda fijo tras el primer arranque); todo lo demás sí se aplica ya.
@@ -82,7 +87,7 @@ fn save_settings(
     cfg.default_printer = default_printer;
     cfg.autostart = autostart;
     cfg.save();
-    Ok(())
+    Ok(autostart_warning)
     // Nota: cambiar allowed_origin aquí solo actualiza el archivo de config;
     // el CORS del servidor Axum ya en ejecución mantiene el valor con el que
     // arrancó. Reiniciar el agente aplica el nuevo origen al servidor HTTP.
