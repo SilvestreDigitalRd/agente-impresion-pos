@@ -54,6 +54,16 @@ pub struct LogoRaster {
     pub data_base64: String,
 }
 
+// Auditoría, hallazgo N.º 7 (pago mixto): una línea del desglose de
+// InvoiceDoc.payments — mismo criterio de deny_unknown_fields que el resto
+// de los structs que vienen del backend (ver la nota larga en InvoiceItem).
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct PaymentLine {
+    pub method: String,
+    pub amount: f64,
+}
+
 #[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)] // M16: ver nota en InvoiceItem
 pub struct InvoiceDoc {
@@ -91,6 +101,14 @@ pub struct InvoiceDoc {
     pub discount_amount: f64,
     pub total: f64,
     pub payment_method: String,
+    // Auditoría, hallazgo N.º 7 (pago mixto): desglose real cuando
+    // payment_method == "mixed" — None para cualquier venta con un solo
+    // método. #[serde(default)] es a propósito: un frontend cacheado de
+    // ANTES de esta ronda no manda esta clave en absoluto, y bajo
+    // deny_unknown_fields una clave que falta rompería el parseo entero
+    // (toda la impresión) si no fuera opcional con default.
+    #[serde(default)]
+    pub payments: Option<Vec<PaymentLine>>,
     pub footer: Option<String>,
     // Ausente/null si el negocio no tiene logo configurado, o si el
     // navegador no pudo cargarlo — mismo criterio de "nunca bloquear la
@@ -638,7 +656,11 @@ mod win {
                 + line_h * 2.0                                            // Subtotal + ITBIS
                 + if invoice.discount_amount > 0.0 { line_h } else { 0.0 } // Descuento (si aplica)
                 + line_h * 1.3                                            // TOTAL
-                + line_h * 1.5                                            // Método de pago
+                // Auditoría, hallazgo N.º 7 (pago mixto): "Método de pago"
+                // pasa a ser VARIAS líneas cuando es mixto (una por cada
+                // método) — reservar solo 1.5 líneas fijas dejaba el pie
+                // pisado o cortado a mitad de un pago mixto de 3 métodos.
+                + line_h * (0.5 + invoice.payments.as_ref().map_or(1, |p| p.len().max(1)) as f64)
                 + line_h * footer_lines.len() as f64;                     // pie (si lo hay)
             ensure_space(hdc, &mut y, footer_reserved)?;
 
@@ -650,8 +672,38 @@ mod win {
                 draw(hdc, margin, y, "Descuento"); draw(hdc, col2, y, &format!("-{}", money(invoice.discount_amount))); y += line_h;
             }
             draw(hdc, margin, y, "TOTAL"); draw(hdc, col2, y, &money(invoice.total)); y += line_h * 1.3;
-            draw(hdc, margin, y, &format!("Método de pago: {}", invoice.payment_method));
-            y += line_h * 1.5;
+            // Auditoría, hallazgo N.º 7 (pago mixto): antes esto imprimía
+            // literal "Método de pago: mixed" — la palabra en inglés, sin
+            // ningún desglose, para cualquier venta con más de un método.
+            fn payment_label(m: &str) -> &str {
+                match m {
+                    "cash" => "Efectivo",
+                    "card" => "Tarjeta",
+                    "transfer" => "Transferencia",
+                    "credit" => "Crédito (fiado)",
+                    other => other,
+                }
+            }
+            if invoice.payment_method == "mixed" {
+                if let Some(lines) = invoice.payments.as_ref().filter(|p| !p.is_empty()) {
+                    draw(hdc, margin, y, "Pago mixto:");
+                    y += line_h;
+                    for p in lines {
+                        draw(hdc, margin, y, &format!("  {}", payment_label(&p.method)));
+                        draw(hdc, col2, y, &money(p.amount));
+                        y += line_h;
+                    }
+                } else {
+                    // Por si acaso: 'mixed' pero sin desglose (frontend viejo
+                    // que todavía no manda `payments`) — mejor esto que nada.
+                    draw(hdc, margin, y, "Método de pago: Mixto");
+                    y += line_h;
+                }
+            } else {
+                draw(hdc, margin, y, &format!("Método de pago: {}", payment_label(&invoice.payment_method)));
+                y += line_h;
+            }
+            y += line_h * 0.5;
 
             for line in &footer_lines {
                 draw(hdc, margin, y, line);
