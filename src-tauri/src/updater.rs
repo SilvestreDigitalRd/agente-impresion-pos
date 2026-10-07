@@ -63,6 +63,11 @@ pub struct UpdateStatus {
     pub version: Option<String>,
     pub current_version: String,
     pub notes: Option<String>,
+    /// Ronda 10b: `Some(mensaje)` si la comprobación NO pudo completarse (sin
+    /// Internet, release en borrador/privado → 404, firma o JSON inválidos…).
+    /// Antes todo eso se devolvía como `available:false` y la ventana decía
+    /// "Ya tienes la última versión" aunque nunca se hubiera podido comprobar.
+    pub error: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -102,7 +107,7 @@ pub async fn check_agent_update(app: AppHandle) -> Result<UpdateStatus, String> 
         Ok(u) => u,
         Err(e) => {
             log_line(&format!("No se pudo inicializar el actualizador: {e}"));
-            return Ok(UpdateStatus { available: false, version: None, current_version, notes: None });
+            return Ok(UpdateStatus { available: false, version: None, current_version, notes: None, error: Some(format!("No se pudo inicializar el actualizador: {e}")) });
         }
     };
 
@@ -113,15 +118,18 @@ pub async fn check_agent_update(app: AppHandle) -> Result<UpdateStatus, String> 
             let notes = update.body.clone();
             let pending = app.state::<PendingUpdate>();
             *pending.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(update);
-            Ok(UpdateStatus { available: true, version: Some(version), current_version, notes })
+            Ok(UpdateStatus { available: true, version: Some(version), current_version, notes, error: None })
         }
-        Ok(None) => Ok(UpdateStatus { available: false, version: None, current_version, notes: None }),
+        Ok(None) => {
+            log_line(&format!("Comprobación de actualización: sin novedades (versión instalada {current_version})"));
+            Ok(UpdateStatus { available: false, version: None, current_version, notes: None, error: None })
+        }
         Err(e) => {
             // Acá caen: sin Internet, DNS, timeout, 4xx/5xx del servidor de
             // releases, JSON del manifest inválido, etc. — todos el mismo
             // caso para quien llama: "seguí como si no hubiera nada nuevo".
             log_line(&format!("No se pudo comprobar actualización (se sigue trabajando con normalidad): {e}"));
-            Ok(UpdateStatus { available: false, version: None, current_version, notes: None })
+            Ok(UpdateStatus { available: false, version: None, current_version, notes: None, error: Some(e.to_string()) })
         }
     }
 }

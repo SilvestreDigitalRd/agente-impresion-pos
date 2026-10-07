@@ -15,6 +15,16 @@ on:
   workflow_dispatch: {}
 
 jobs:
+  pruebas:
+    # Ronda 10b: las pruebas del servidor/cola/gaveta (testbed/) corren en cada push — no necesitan Tauri ni Windows.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cargo test (testbed)
+        run: cargo test -- --test-threads=1
+        working-directory: testbed
+
   release:
     # Solo corre cuando el push fue de un tag (v1.0.0, v1.0.1, ...) — nunca
     # en un push común a main ni en un workflow_dispatch manual sin tag.
@@ -27,6 +37,22 @@ jobs:
 
       - name: Instalar Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # Ronda 10b: el updater compara contra la versión de tauri.conf.json, y la
+      # pantalla/log muestran la de Cargo.toml. Si el tag, Cargo.toml y
+      # tauri.conf.json no coinciden, el release sale con un latest.json que
+      # engaña al updater ("ya tienes la última versión" sin ser cierto).
+      - name: Verificar que tag, Cargo.toml y tauri.conf.json coinciden
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"; TAG="${TAG#-}"
+          CARGO=$(grep -m1 '^version' src-tauri/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          CONF=$(grep -m1 '"version"' src-tauri/tauri.conf.json | sed 's/.*: *"\(.*\)".*/\1/')
+          echo "tag=$TAG cargo=$CARGO conf=$CONF"
+          if [ "$TAG" != "$CARGO" ] || [ "$CARGO" != "$CONF" ]; then
+            echo "::error::Versiones distintas: tag=$TAG, Cargo.toml=$CARGO, tauri.conf.json=$CONF. Corrígelas y vuelve a crear el tag."
+            exit 1
+          fi
 
       # Reemplaza "cargo tauri build" + softprops/action-gh-release: arma
       # el build Y genera/sube el `latest.json` que tauri.conf.json espera

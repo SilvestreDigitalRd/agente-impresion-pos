@@ -127,9 +127,14 @@ async function checkForUpdate() {
   msg.textContent = 'Buscando actualización…';
   try {
     const status = await invoke('check_agent_update');
+    if (status.error) {
+      // La comprobación NO se pudo completar: no es "ya estás al día".
+      msg.textContent = `No se pudo comprobar si hay actualización (versión instalada ${status.current_version}): ${status.error}. Revisa tu conexión a Internet; el detalle queda en agente.log.`;
+      return;
+    }
     if (!status.available) {
-      msg.textContent = 'Ya tenés la última versión.';
-      setTimeout(() => (msg.textContent = ''), 4000);
+      msg.textContent = `Ya tienes la última versión (instalada: ${status.current_version}).`;
+      setTimeout(() => (msg.textContent = ''), 6000);
       return;
     }
     msg.textContent = `Versión ${status.version} disponible — descargando…`;
