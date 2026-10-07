@@ -5,6 +5,26 @@ instalador `.msi`/`.exe` de Windows normal — doble clic, sin terminal, sin
 instalar Node.js. Corre en la bandeja del sistema y arranca solo con Windows
 (configurable).
 
+## Novedades 1.1.0 (ronda 10b)
+
+- **Cola de reintentos de impresión** para comprobantes fiscales (`retry:true`), persistente en disco.
+- **Registro de aperturas de gaveta** (`gaveta.jsonl`, `GET /v1/drawer-log`) que la web sincroniza a la bitácora del sistema.
+- **Puerto por defecto 17890** (el 9100 es el puerto de las impresoras de red); editable desde la ventana, se aplica sin reiniciar, y si el puerto está ocupado el error se muestra en la ventana en vez de perderse.
+- **Rutas sin `/v1` desactivadas** en instalaciones nuevas (las existentes conservan la compatibilidad hasta que la apagues en la ventana).
+- **Logo en A4/Carta**: tamaño acotado por ancho y por alto (28 mm), escalado entero al ampliar y `COLORONCOLOR` al reducir; si no cabe en la página, se omite en vez de dibujarse cortado.
+- Corregido: un trabajo fallido ya no queda como "duplicado" 60 s.
+- Contrato completo: `CONTRATO_WEB_AGENTE_v1.1.md`.
+
+### Pruebas
+
+`testbed/` compila los módulos sin Tauri y los prueba en cualquier sistema (40 pruebas: unitarias + servidor HTTP real con una impresora simulada):
+
+```bash
+cd testbed && cargo test -- --test-threads=1
+```
+
+**Lo que estas pruebas NO cubren:** todo el código específico de Windows (`printer_win.rs` módulo `win` de Windows: winspool y GDI, incluido el nuevo cálculo del logo con `SetStretchBltMode`) y `main.rs`/ventana. Esa parte hay que compilarla con el workflow de GitHub Actions y probarla con una impresora real (ticket con gaveta, A4 con logo, impresora apagada con `retry:true`).
+
 ## ⚠️ Aviso importante sobre este entregable
 
 Este código fue escrito y revisado cuidadosamente, pero **no se compiló ni

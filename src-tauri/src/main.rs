@@ -2,8 +2,11 @@
 // en la bandeja del sistema, como cualquier programa de fondo).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod escpos;
 mod http_server;
+mod layout;
 mod printer_win;
+mod queue;
 mod state;
 mod updater;
 
@@ -29,6 +32,13 @@ struct StatusPayload {
     default_printer: Option<String>,
     autostart: bool,
     agent_version: &'static str,
+    legacy_routes: bool,
+    /// Puerto en el que el servidor escucha de verdad ahora (0 = ninguno).
+    bound_port: u16,
+    /// Mensaje si el puerto no se pudo abrir (None = todo bien).
+    bind_error: Option<String>,
+    /// Trabajos de impresión esperando reintento.
+    queued: usize,
 }
 
 #[tauri::command]
@@ -41,6 +51,10 @@ fn get_status(state: TauriState<Arc<AppState>>) -> StatusPayload {
         default_printer: cfg.default_printer.clone().or_else(printer_win::default_printer),
         autostart: cfg.autostart,
         agent_version: env!("CARGO_PKG_VERSION"),
+        legacy_routes: cfg.legacy_routes,
+        bound_port: state.bound_port.load(std::sync::atomic::Ordering::SeqCst),
+        bind_error: state.bind_error(),
+        queued: state.queue().len(),
     }
 }
 
@@ -63,7 +77,14 @@ fn save_settings(
     allowed_origin: String,
     default_printer: Option<String>,
     autostart: bool,
+    port: u16,
+    legacy_routes: bool,
 ) -> Result<Option<String>, String> {
+    // Puertos < 1024 son privilegiados y 0 no es un puerto: se rechaza antes
+    // de guardar nada (un valor inválido dejaba al agente sin servidor).
+    if port < 1024 {
+        return Err("El puerto debe estar entre 1024 y 65535.".into());
+    }
     // Antes esta función encadenaba con `?`: si `enable()`/`disable()` del
     // plugin de autostart fallaba por CUALQUIER motivo (la app corriendo sin
     // instalar del todo, permisos del registro de Windows, etc.), la función
@@ -80,17 +101,25 @@ fn save_settings(
         .err()
         .map(|e| format!("No se pudo actualizar el inicio automático de Windows: {e}"));
 
-    // El puerto NO se puede cambiar en caliente sin reiniciar el servidor
-    // (queda fijo tras el primer arranque); todo lo demás sí se aplica ya.
-    let mut cfg = state.lock();
-    cfg.allowed_origin = allowed_origin;
-    cfg.default_printer = default_printer;
-    cfg.autostart = autostart;
-    cfg.save();
+    // Ronda 10b: puerto y rutas legacy también se aplican en caliente — el
+    // servidor (http_server::run) se reinicia solo al recibir `server_reload`.
+    // El origen permitido ya se releía en cada petición (auditoría B4).
+    let needs_reload;
+    {
+        let mut cfg = state.lock();
+        needs_reload = cfg.port != port || cfg.legacy_routes != legacy_routes;
+        cfg.allowed_origin = allowed_origin;
+        cfg.default_printer = default_printer;
+        cfg.autostart = autostart;
+        cfg.port = port;
+        cfg.legacy_routes = legacy_routes;
+        cfg.save();
+    }
+    if needs_reload {
+        crate::state::log_line(&format!("Configuración cambiada: puerto {port}, rutas legacy {legacy_routes} — reiniciando servidor local"));
+        state.server_reload.notify_one();
+    }
     Ok(autostart_warning)
-    // Nota: cambiar allowed_origin aquí solo actualiza el archivo de config;
-    // el CORS del servidor Axum ya en ejecución mantiene el valor con el que
-    // arrancó. Reiniciar el agente aplica el nuevo origen al servidor HTTP.
 }
 
 fn main() {

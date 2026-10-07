@@ -18,12 +18,18 @@
 //! cualquier otro proceso local — eso es un problema de seguridad del
 //! sistema operativo del cliente, no algo que un servidor en loopback
 //! pueda prevenir por sí mismo.
+//!
+//! Ronda 10b: cola de reintentos de impresión (`retry:true`), registro de
+//! aperturas de gaveta (`/v1/drawer-log`), rutas legacy sin `/v1` opcionales,
+//! reinicio del servidor al cambiar el puerto y error de bind visible.
+use crate::escpos::{self, DrawerEvent, DrawerLog};
 use crate::printer_win;
+use crate::queue::{EnqueueResult, FailOutcome};
 use crate::state::{tokens_match, AppState};
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::{HeaderMap, Method, StatusCode},
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
@@ -37,6 +43,13 @@ use tower_http::limit::RequestBodyLimitLayer;
 struct Ctx {
     state: Arc<AppState>,
     print_guard: Arc<PrintGuard>,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /**
@@ -76,6 +89,14 @@ impl PrintGuard {
         jobs.insert(job_id.to_string(), std::time::Instant::now());
         false
     }
+
+    /// Ronda 10b (bug previo): un trabajo que FALLÓ seguía marcado como
+    /// "reciente" durante 60s, así que el reintento manual del cajero se
+    /// contestaba `{ok:true, deduped:true}` SIN imprimir nada. Ahora, al
+    /// fallar, se olvida el jobId para que el reintento sí imprima.
+    fn forget(&self, job_id: &str) {
+        self.recent_jobs.lock().unwrap_or_else(|p| p.into_inner()).remove(job_id);
+    }
 }
 
 #[derive(Serialize)]
@@ -83,6 +104,7 @@ struct HealthResp {
     ok: bool,
     version: &'static str,
     default_printer: Option<String>,
+    queued: usize,
 }
 
 #[derive(Serialize)]
@@ -90,24 +112,30 @@ struct PrintersResp {
     printers: Vec<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 struct PrintReq {
     // Modo térmico (existente): bytes ESC/POS ya armados en el navegador.
-    #[serde(rename = "dataBase64")]
+    #[serde(rename = "dataBase64", skip_serializing_if = "Option::is_none")]
     data_base64: Option<String>,
-    #[serde(rename = "printerName")]
+    #[serde(rename = "printerName", skip_serializing_if = "Option::is_none")]
     printer_name: Option<String>,
     // Modo hoja completa (A4/Carta): el agente arma la página con GDI a
     // partir de datos estructurados — no llegan bytes de impresora crudos.
-    #[serde(rename = "paperSize")]
+    #[serde(rename = "paperSize", skip_serializing_if = "Option::is_none")]
     paper_size: Option<String>, // "a4" | "letter"
+    #[serde(skip_serializing_if = "Option::is_none")]
     invoice: Option<printer_win::InvoiceDoc>,
     // Auditoría, hallazgo M5: id estable del trabajo (el frontend manda
     // invoice.id) — permite descartar un reintento del MISMO trabajo sin
     // imprimir dos veces. Opcional por compatibilidad con un frontend
     // viejo que todavía no lo mande.
-    #[serde(rename = "jobId")]
+    #[serde(rename = "jobId", skip_serializing_if = "Option::is_none")]
     job_id: Option<String>,
+    // Ronda 10b: si la impresión falla de forma definitiva, en vez de
+    // devolver error se guarda en la cola persistente y se reintenta sola
+    // (pensado para comprobantes fiscales ya emitidos). Requiere `jobId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -184,10 +212,12 @@ async fn health(State(ctx): State<Ctx>, headers: HeaderMap) -> impl IntoResponse
     let default_printer = tokio::task::spawn_blocking(printer_win::default_printer)
         .await
         .unwrap_or(None);
+    let queued = ctx.state.queue().len();
     Json(HealthResp {
         ok: true,
         version: env!("CARGO_PKG_VERSION"),
         default_printer,
+        queued,
     })
     .into_response()
 }
@@ -214,67 +244,71 @@ async fn printers(State(ctx): State<Ctx>, headers: HeaderMap) -> impl IntoRespon
     }
 }
 
-async fn print(
-    State(ctx): State<Ctx>,
-    headers: HeaderMap,
-    Json(body): Json<PrintReq>,
-) -> impl IntoResponse {
-    if let Err(e) = check_token(&headers, &ctx) {
-        return e.into_response();
-    }
+// ---------------------------------------------------------------------------
+// Núcleo de impresión (lo usan el handler /print y el worker de la cola)
+// ---------------------------------------------------------------------------
 
-    // Dedup por jobId (auditoría M5) — un reintento del MISMO trabajo
-    // dentro de los últimos 60s se descarta como éxito silencioso en vez
-    // de volver a imprimir. Sin jobId (frontend viejo), no hay nada que
-    // deduplicar — se sigue de largo como siempre.
-    if let Some(job_id) = &body.job_id {
-        if ctx.print_guard.is_duplicate(job_id) {
-            return Json(serde_json::json!({ "ok": true, "deduped": true })).into_response();
-        }
-    }
+struct PrintFail {
+    status: StatusCode,
+    code: &'static str,
+    detail: String,
+    /// true = el fallo es DEFINITIVO (la impresora rechazó/falló) y es seguro
+    /// reintentar sin riesgo de imprimir doble. Un timeout NO lo es: el hilo
+    /// de Win32 no se puede cancelar y el ticket pudo haber salido igual.
+    retriable: bool,
+}
 
+impl PrintFail {
+    fn new(status: StatusCode, code: &'static str, detail: impl Into<String>, retriable: bool) -> Self {
+        Self { status, code, detail: detail.into(), retriable }
+    }
+    fn into_response(self) -> Response {
+        (self.status, Json(ErrorResp { error: self.code.into(), detail: self.detail })).into_response()
+    }
+}
+
+struct PrintDone {
+    pulses: usize,
+}
+
+/// Ejecuta UN trabajo de impresión. `strip_drawer`: quita los comandos de
+/// apertura de gaveta (reintentos desde la cola — no abrir la gaveta horas
+/// después, a destiempo).
+async fn run_print(
+    state: &Arc<AppState>,
+    guard: &PrintGuard,
+    body: &PrintReq,
+    strip_drawer: bool,
+) -> Result<PrintDone, PrintFail> {
     let printer_name = body
         .printer_name
+        .clone()
         .filter(|n| !n.trim().is_empty())
-        .or_else(|| ctx.state.lock().default_printer.clone())
+        .or_else(|| state.lock().default_printer.clone())
         .or_else(printer_win::default_printer);
 
     let Some(printer_name) = printer_name else {
-        return (
+        return Err(PrintFail::new(
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ErrorResp {
-                error: "SIN_IMPRESORA_CONFIGURADA".into(),
-                detail: "No hay impresora predeterminada ni configurada en este equipo.".into(),
-            }),
-        )
-            .into_response();
+            "SIN_IMPRESORA_CONFIGURADA",
+            "No hay impresora predeterminada ni configurada en este equipo.",
+            false,
+        ));
     };
 
     // Auditoría, hallazgo B5: desde acá hasta el final de esta función hay
     // una impresión física en curso — el actualizador del agente
     // (updater.rs) nunca instala mientras este contador esté por encima de
-    // cero. RAII: se decrementa solo al salir de esta función, sea cual
-    // sea el camino (éxito, error, timeout, pánico capturado más abajo).
-    let _active_print = crate::state::ActivePrintGuard::new(&ctx.state);
+    // cero. RAII: se decrementa solo al salir, sea cual sea el camino.
+    let _active_print = crate::state::ActivePrintGuard::new(state);
 
     // ---- Modo hoja completa (A4/Carta): datos estructurados + GDI --------
     if let (Some(paper_size), Some(invoice)) = (body.paper_size.clone(), body.invoice.clone()) {
-        // spawn_blocking: print_a4_document hace llamadas Win32 SÍNCRONAS
-        // (StartDocW, StretchDIBits, etc.) — corridas directo en el handler
-        // async, una impresora lenta o atascada bloquearía este hilo del
-        // runtime de tokio, dejando /health y /printers sin responder
-        // mientras dura. spawn_blocking las manda a un hilo dedicado para
-        // trabajo bloqueante, sin retener el runtime async.
         let printer_name_owned = printer_name.clone();
-        // Semáforo (M5): espera si ya hay 2 impresiones físicas en curso,
-        // en vez de lanzar un hilo bloqueante más sin límite.
-        let _permit = ctx.print_guard.semaphore.acquire().await;
-        // Timeout (M5): si el spooler se cuelga, quien llamó a /print no
-        // se queda esperando para siempre — a los 30s se le devuelve un
-        // error igual. OJO: esto NO cancela el trabajo bloqueante en sí
-        // (Win32 no da forma de cancelar una llamada síncrona a mitad de
-        // camino) — el hilo sigue corriendo de fondo; el timeout acota
-        // cuánto espera el HTTP, no cuánto tarda realmente la impresora.
+        // Semáforo (M5): espera si ya hay 2 impresiones físicas en curso.
+        let _permit = guard.semaphore.acquire().await;
+        // Timeout (M5): NO cancela el trabajo bloqueante en sí (Win32 no
+        // permite cancelar una llamada síncrona) — acota la espera del HTTP.
         let join_result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             tokio::task::spawn_blocking(move || {
@@ -284,95 +318,237 @@ async fn print(
         .await;
 
         return match join_result {
-            Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
+            Ok(Ok(Ok(()))) => Ok(PrintDone { pulses: 0 }),
             Ok(Ok(Err(msg))) => {
                 crate::state::log_line(&format!("Fallo de impresión (A4/hoja completa): {msg}"));
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
-                )
-                    .into_response()
+                Err(PrintFail::new(StatusCode::INTERNAL_SERVER_ERROR, "FALLO_DE_IMPRESION", msg, true))
             }
-            // El hilo de impresión entró en pánico (ej. un bug real en el
-            // layout manual del logo, ver printer_win.rs) — se informa como
-            // error de impresión en vez de tumbar el proceso entero, que es
-            // lo que pasaría si el pánico llegara sin atajar hasta acá.
             Ok(Err(join_err)) => {
                 crate::state::log_line(&format!("Pánico en el hilo de impresión (A4): {join_err}"));
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
-                )
-                    .into_response()
+                Err(PrintFail::new(StatusCode::INTERNAL_SERVER_ERROR, "FALLO_DE_IMPRESION", join_err.to_string(), true))
             }
             Err(_elapsed) => {
                 crate::state::log_line("Impresión A4 excedió el tiempo límite (30s)");
-                (
+                Err(PrintFail::new(
                     StatusCode::GATEWAY_TIMEOUT,
-                    Json(ErrorResp { error: "IMPRESION_TIMEOUT".into(), detail: "La impresora no respondió a tiempo (30s).".into() }),
-                )
-                    .into_response()
+                    "IMPRESION_TIMEOUT",
+                    "La impresora no respondió a tiempo (30s).",
+                    false,
+                ))
             }
         };
     }
 
     // ---- Modo térmico (existente): bytes ESC/POS crudos -------------------
     let Some(data_base64) = &body.data_base64 else {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(ErrorResp { error: "FALTA_DATA_BASE64_O_INVOICE".into(), detail: "".into() }),
-        )
-            .into_response();
+        return Err(PrintFail::new(StatusCode::UNPROCESSABLE_ENTITY, "FALTA_DATA_BASE64_O_INVOICE", "", false));
     };
 
     use base64::{engine::general_purpose::STANDARD, Engine as _};
-    let bytes = match STANDARD.decode(data_base64) {
+    let mut bytes = match STANDARD.decode(data_base64) {
         Ok(b) => b,
         Err(_) => {
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(ErrorResp { error: "BASE64_INVALIDO".into(), detail: "".into() }),
-            )
-                .into_response()
+            return Err(PrintFail::new(StatusCode::UNPROCESSABLE_ENTITY, "BASE64_INVALIDO", "", false));
         }
     };
+    if strip_drawer {
+        bytes = escpos::strip_drawer_pulses(&bytes);
+    }
+    let pulses = escpos::count_drawer_pulses(&bytes);
 
     // Único punto de contacto con el sistema operativo: escribir bytes
     // crudos al spooler vía la API nativa de Win32. Nunca un shell.
-    // Mismo motivo que arriba: spawn_blocking para no retener el runtime
-    // async mientras el spooler procesa el trabajo, más semáforo+timeout
-    // (M5) igual que el modo A4.
-    let _permit = ctx.print_guard.semaphore.acquire().await;
+    let _permit = guard.semaphore.acquire().await;
+    let printer_for_log = printer_name.clone();
     let join_result = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         tokio::task::spawn_blocking(move || printer_win::print_raw(&printer_name, &bytes)),
     )
     .await;
     match join_result {
-        Ok(Ok(Ok(()))) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Ok(Ok(Ok(()))) => {
+            // Ronda 10b: rastro de cada apertura de gaveta (antes ninguno).
+            if pulses > 0 {
+                let ev = DrawerEvent {
+                    ts: now_secs(),
+                    job_id: body.job_id.clone(),
+                    printer: printer_for_log,
+                    pulses,
+                };
+                if let Err(e) = DrawerLog::append(&state.data_dir, &ev) {
+                    crate::state::log_line(&format!("No se pudo registrar la apertura de gaveta: {e}"));
+                }
+            }
+            Ok(PrintDone { pulses })
+        }
         Ok(Ok(Err(msg))) => {
             crate::state::log_line(&format!("Fallo de impresión (térmica): {msg}"));
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: msg }),
-            )
-                .into_response()
+            Err(PrintFail::new(StatusCode::INTERNAL_SERVER_ERROR, "FALLO_DE_IMPRESION", msg, true))
         }
         Ok(Err(join_err)) => {
             crate::state::log_line(&format!("Pánico en el hilo de impresión (térmica): {join_err}"));
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResp { error: "FALLO_DE_IMPRESION".into(), detail: join_err.to_string() }),
-            )
-                .into_response()
+            Err(PrintFail::new(StatusCode::INTERNAL_SERVER_ERROR, "FALLO_DE_IMPRESION", join_err.to_string(), true))
         }
         Err(_elapsed) => {
             crate::state::log_line("Impresión térmica excedió el tiempo límite (30s)");
-            (
+            Err(PrintFail::new(
                 StatusCode::GATEWAY_TIMEOUT,
-                Json(ErrorResp { error: "IMPRESION_TIMEOUT".into(), detail: "La impresora no respondió a tiempo (30s).".into() }),
+                "IMPRESION_TIMEOUT",
+                "La impresora no respondió a tiempo (30s).",
+                false,
+            ))
+        }
+    }
+}
+
+async fn print(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): Json<PrintReq>) -> Response {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+
+    // Ya está en la cola de reintentos: no se imprime otra vez ni se vuelve
+    // a encolar — se informa que sigue pendiente.
+    if let Some(job_id) = &body.job_id {
+        if ctx.state.queue().contains(job_id) {
+            return (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({ "ok": false, "queued": true, "deduped": true, "jobId": job_id })),
             )
-                .into_response()
+                .into_response();
+        }
+        // Dedup por jobId (auditoría M5) — un reintento del MISMO trabajo
+        // dentro de los últimos 60s se descarta como éxito silencioso.
+        if ctx.print_guard.is_duplicate(job_id) {
+            return Json(serde_json::json!({ "ok": true, "deduped": true })).into_response();
+        }
+    }
+
+    match run_print(&ctx.state, &ctx.print_guard, &body, false).await {
+        Ok(done) => Json(serde_json::json!({
+            "ok": true,
+            "drawerOpened": done.pulses > 0,
+        }))
+        .into_response(),
+        Err(fail) => {
+            if let Some(job_id) = &body.job_id {
+                ctx.print_guard.forget(job_id);
+            }
+            let wants_retry = body.retry.unwrap_or(false);
+            if let (true, true, Some(job_id)) = (wants_retry, fail.retriable, body.job_id.clone()) {
+                let payload = serde_json::to_value(&body).unwrap_or(serde_json::Value::Null);
+                let enq = ctx.state.queue().enqueue(&job_id, payload, now_secs(), &format!("{}: {}", fail.code, fail.detail));
+                match enq {
+                    EnqueueResult::Queued | EnqueueResult::AlreadyQueued => {
+                        crate::state::log_line(&format!("Trabajo {job_id} a la cola de reintentos ({}: {})", fail.code, fail.detail));
+                        return (
+                            StatusCode::ACCEPTED,
+                            Json(serde_json::json!({
+                                "ok": false,
+                                "queued": true,
+                                "jobId": job_id,
+                                "error": fail.code,
+                                "detail": fail.detail,
+                                "drawerOpened": false,
+                            })),
+                        )
+                            .into_response();
+                    }
+                    EnqueueResult::Full => {
+                        crate::state::log_line("Cola de reintentos llena: se devuelve el error original");
+                    }
+                }
+            }
+            fail.into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cola y registro de gaveta
+// ---------------------------------------------------------------------------
+
+async fn queue_list(State(ctx): State<Ctx>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+    let q = ctx.state.queue();
+    Json(serde_json::json!({ "count": q.len(), "jobs": q.summary(), "expired": q.expired() })).into_response()
+}
+
+#[derive(Deserialize)]
+struct JobIdReq {
+    #[serde(rename = "jobId")]
+    job_id: String,
+}
+
+async fn queue_cancel(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<JobIdReq>) -> Response {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+    let ok = ctx.state.queue().cancel(&b.job_id);
+    if ok {
+        crate::state::log_line(&format!("Trabajo {} cancelado de la cola por el usuario", b.job_id));
+    }
+    Json(serde_json::json!({ "ok": ok })).into_response()
+}
+
+async fn queue_retry_now(State(ctx): State<Ctx>, headers: HeaderMap, Json(b): Json<JobIdReq>) -> Response {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+    let ok = ctx.state.queue().retry_now(&b.job_id, now_secs());
+    Json(serde_json::json!({ "ok": ok })).into_response()
+}
+
+#[derive(Deserialize)]
+struct DrawerQuery {
+    since: Option<u64>,
+    limit: Option<usize>,
+}
+
+async fn drawer_log(State(ctx): State<Ctx>, headers: HeaderMap, Query(q): Query<DrawerQuery>) -> Response {
+    if let Err(e) = check_token(&headers, &ctx) {
+        return e.into_response();
+    }
+    let dir = ctx.state.data_dir.clone();
+    let since = q.since.unwrap_or(0);
+    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    let events = tokio::task::spawn_blocking(move || DrawerLog::read_since(&dir, since, limit))
+        .await
+        .unwrap_or_default();
+    Json(serde_json::json!({ "events": events })).into_response()
+}
+
+/// Worker: cada 2 s toma los trabajos vencidos de la cola y los reintenta.
+async fn queue_worker(state: Arc<AppState>, guard: Arc<PrintGuard>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let due = state.queue().take_due(now_secs());
+        for job in due {
+            let req = match serde_json::from_value::<PrintReq>(job.payload.clone()) {
+                Ok(r) => r,
+                Err(e) => {
+                    crate::state::log_line(&format!("Trabajo {} en cola con datos ilegibles ({e}) — se descarta", job.job_id));
+                    state.queue().cancel(&job.job_id);
+                    continue;
+                }
+            };
+            match run_print(&state, &guard, &req, true).await {
+                Ok(_) => {
+                    state.queue().complete(&job.job_id);
+                    crate::state::log_line(&format!("Trabajo {} impreso desde la cola (intento {})", job.job_id, job.attempts + 1));
+                }
+                Err(f) => {
+                    let out = state.queue().fail(&job.job_id, now_secs(), &format!("{}: {}", f.code, f.detail));
+                    match out {
+                        FailOutcome::Expired => crate::state::log_line(&format!(
+                            "Trabajo {} VENCIÓ en la cola sin poder imprimirse ({}: {})",
+                            job.job_id, f.code, f.detail
+                        )),
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }
@@ -398,7 +574,7 @@ async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): J
         return e.into_response();
     }
 
-    // Auditoría, hallazgo B5: mismo criterio que en print() — esto también
+    // Auditoría, hallazgo B5: mismo criterio que en run_print — esto también
     // es una impresión física en curso (reenviada a una impresora de red),
     // el actualizador tampoco debe instalar mientras esto está en vuelo.
     let _active_print = crate::state::ActivePrintGuard::new(&ctx.state);
@@ -464,22 +640,16 @@ async fn print_network(State(ctx): State<Ctx>, headers: HeaderMap, Json(body): J
     }
 }
 
-pub async fn run(state: Arc<AppState>) {
-    let port = state.lock().port;
-
+fn build_router(state: &Arc<AppState>, print_guard: Arc<PrintGuard>, legacy_routes: bool) -> Router {
     // CORS ESTRICTO: un único origen exacto, nunca '*' ni un patrón amplio.
     // Como exigimos Content-Type: application/json + header custom, CUALQUIER
     // petición cross-origin dispara preflight (OPTIONS) obligatorio — una
     // página maliciosa no puede evitarlo ni leer la respuesta si su origen
     // no es exactamente este.
     //
-    // Auditoría, hallazgo B4: antes `allowed_origin` se leía UNA vez acá y
-    // quedaba fijo en el CorsLayer para toda la vida del proceso — cambiar
-    // el origen permitido (Configuración → Agente local) exigía reiniciar
-    // el agente para que surtiera efecto. Con `AllowOrigin::predicate`, el
-    // origen se relee del estado compartido EN CADA petición — el mismo
-    // Arc<AppState> que ya usan los handlers, así que un cambio de
-    // configuración aplica de inmediato, sin reiniciar nada.
+    // Auditoría, hallazgo B4: con `AllowOrigin::predicate` el origen se relee
+    // del estado compartido EN CADA petición — un cambio de configuración
+    // aplica de inmediato, sin reiniciar nada.
     let state_for_cors = state.clone();
     let cors = CorsLayer::new()
         .allow_origin(tower_http::cors::AllowOrigin::predicate(move |origin, _parts| {
@@ -493,49 +663,82 @@ pub async fn run(state: Arc<AppState>) {
         ])
         // Chrome exige esto en el preflight para que una página normal
         // pueda hablarle a un servidor en loopback/red local (Private
-        // Network Access) — sin esto, versiones recientes de Chrome
-        // empiezan a bloquear la petición de entrada, aunque el resto de
-        // la configuración de CORS esté perfecta (auditoría B4).
+        // Network Access) (auditoría B4).
         .allow_private_network(true);
 
-    let ctx = Ctx { state: state.clone(), print_guard: Arc::new(PrintGuard::new()) };
-    let app = Router::new()
-        // Auditoría, hallazgo M16: contrato versionado bajo /v1 — esto se había
-        // documentado y aplicado en los structs (deny_unknown_fields, ver arriba)
-        // pero se había quedado afuera acá, en el router, por un merge parcial de
-        // esa entrega. El frontend (print.js) ya llama a /v1/health, /v1/print y
-        // /v1/print-network desde esa misma ronda — sin estas rutas, cualquier
-        // agente en producción responde 404 a todo lo que la app web le pide.
+    let ctx = Ctx { state: state.clone(), print_guard };
+    let mut app = Router::new()
+        // Contrato versionado bajo /v1 (auditoría M16).
         .route("/v1/health", get(health))
         .route("/v1/printers", get(printers))
         .route("/v1/print", post(print))
         .route("/v1/print-network", post(print_network))
-        // TODO(B5): borrar estas 4 rutas sin prefijo una vez que el updater esté
-        // andando en producción y ya no haya agentes viejos hablando sin /v1.
-        .route("/health", get(health))
-        .route("/printers", get(printers))
-        .route("/print", post(print))
-        .route("/print-network", post(print_network))
-        .layer(cors)
-        // Límite explícito de tamaño de body — antes no había ninguno, así
-        // que /print aceptaba un dataBase64/logo.dataBase64 de cualquier
-        // tamaño. Un payload de cientos de MB (token filtrado, o frontend
-        // comprometido) podía agotar la memoria del proceso y colgar el
-        // agente de esa caja. 10MB sobra de sobra para un ticket térmico o
-        // un logo — se aplica DESPUÉS de cors (como capa más externa), para
-        // que corte el body antes de que cualquier otra capa lo procese.
+        // Ronda 10b: cola de reintentos y registro de gaveta.
+        .route("/v1/queue", get(queue_list))
+        .route("/v1/queue/cancel", post(queue_cancel))
+        .route("/v1/queue/retry-now", post(queue_retry_now))
+        .route("/v1/drawer-log", get(drawer_log));
+    if legacy_routes {
+        // Ronda 10b (TODO B5 resuelto): las rutas SIN prefijo ya no se
+        // exponen salvo que la config tenga `legacy_routes: true` (webs viejas
+        // en caché). Instalaciones nuevas nacen con `false`; se apaga desde
+        // la ventana del agente.
+        app = app
+            .route("/health", get(health))
+            .route("/printers", get(printers))
+            .route("/print", post(print))
+            .route("/print-network", post(print_network));
+    }
+    app.layer(cors)
+        // Límite explícito de tamaño de body: 10MB sobra de sobra para un
+        // ticket térmico o un logo — se aplica DESPUÉS de cors (capa más
+        // externa) para cortar el body antes de que otra capa lo procese.
         .layer(RequestBodyLimitLayer::new(10 * 1024 * 1024))
-        .with_state(ctx);
+        .with_state(ctx)
+}
 
-    // Bind EXCLUSIVO a loopback. 0.0.0.0 expondría el agente a toda la LAN
-    // (cualquier otra PC/celular en el WiFi del negocio podría llamarlo).
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+/// Supervisor del servidor: abre el puerto configurado; si falla (puerto
+/// ocupado), deja el error visible en el estado y reintenta cada 10 s o
+/// apenas el usuario cambie el puerto. Cambiar puerto/rutas legacy reinicia
+/// el listener solo, sin cerrar el agente.
+pub async fn run(state: Arc<AppState>) {
+    let guard = Arc::new(PrintGuard::new());
+    tokio::spawn(queue_worker(state.clone(), guard.clone()));
 
-    match tokio::net::TcpListener::bind(addr).await {
-        Ok(listener) => {
-            println!("Agente escuchando en http://{addr} (solo loopback)");
-            axum::serve(listener, app).await.ok();
+    loop {
+        let (port, legacy) = {
+            let c = state.lock();
+            (c.port, c.legacy_routes)
+        };
+        // Bind EXCLUSIVO a loopback. 0.0.0.0 expondría el agente a toda la LAN
+        // (cualquier otra PC/celular en el WiFi del negocio podría llamarlo).
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+
+        match tokio::net::TcpListener::bind(addr).await {
+            Ok(listener) => {
+                state.set_bind_error(None);
+                state.bound_port.store(port, std::sync::atomic::Ordering::SeqCst);
+                crate::state::log_line(&format!("Servidor local escuchando en http://{addr} (solo loopback)"));
+                let app = build_router(&state, guard.clone(), legacy);
+                let st = state.clone();
+                let _ = axum::serve(listener, app)
+                    .with_graceful_shutdown(async move { st.server_reload.notified().await })
+                    .await;
+                state.bound_port.store(0, std::sync::atomic::Ordering::SeqCst);
+                crate::state::log_line("Servidor local reiniciando (cambio de configuración)");
+            }
+            Err(e) => {
+                let msg = format!(
+                    "No se pudo abrir el puerto {port} ({e}). Otro programa lo está usando — cambia el puerto en la configuración del agente."
+                );
+                crate::state::log_line(&msg);
+                state.set_bind_error(Some(msg));
+                state.bound_port.store(0, std::sync::atomic::Ordering::SeqCst);
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(10)) => {}
+                    _ = state.server_reload.notified() => {}
+                }
+            }
         }
-        Err(e) => eprintln!("No se pudo iniciar el servidor local en {addr}: {e}"),
     }
 }

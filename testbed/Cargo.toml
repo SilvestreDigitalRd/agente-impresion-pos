@@ -1,0 +1,25 @@
+# Banco de pruebas del agente: compila SOLO los módulos que no dependen de Tauri
+# (servidor HTTP, estado, cola, gaveta, layout) y los prueba en Linux/macOS/Windows
+# sin necesitar WebView2/webkit. NO es parte del instalador.
+#   cd testbed && cargo test -- --test-threads=1
+[package]
+name = "agente-testbed"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "agentcore"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "macros", "sync"] }
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors", "limit"] }
+rand = "0.8"
+subtle = "2.5"
+base64 = "0.22"
+dirs = "5"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }

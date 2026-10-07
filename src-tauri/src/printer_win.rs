@@ -17,9 +17,9 @@
 //! Windows apuntando a su IP y seleccionarlas aquí por nombre, igual que una
 //! impresora local.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 // Auditoría, hallazgo M16 (versión liviana — el pipeline completo con
 // OpenAPI/typify queda pendiente para cuando el proyecto lo justifique):
 // sin esto, un campo que el frontend cambia de nombre o elimina llega acá y
@@ -43,7 +43,7 @@ pub struct InvoiceItem {
 /// negro, bit=0 -> blanco, MSB primero. El agente solo tiene que reempacar
 /// cada fila al múltiplo de 4 bytes que exige un DIB de Windows — no vuelve
 /// a decidir umbral de blanco/negro ni redimensiona la imagen origen.
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M16: ver nota en InvoiceItem
 pub struct LogoRaster {
     #[serde(rename = "widthPx")]
@@ -57,14 +57,14 @@ pub struct LogoRaster {
 // Auditoría, hallazgo N.º 7 (pago mixto): una línea del desglose de
 // InvoiceDoc.payments — mismo criterio de deny_unknown_fields que el resto
 // de los structs que vienen del backend (ver la nota larga en InvoiceItem).
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct PaymentLine {
     pub method: String,
     pub amount: f64,
 }
 
-#[derive(Deserialize, Clone)]
+#[derive(Deserialize, Serialize, Clone)]
 #[serde(deny_unknown_fields)] // M16: ver nota en InvoiceItem
 pub struct InvoiceDoc {
     pub business_name: String,
@@ -313,11 +313,13 @@ mod win {
         x: i32,
         y: i32,
         dest_w: i32,
+        dest_h: i32,
         logo: &super::LogoRaster,
     ) -> Result<i32, String> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use windows::Win32::Graphics::Gdi::{
-            StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, RGBQUAD, SRCCOPY,
+            SetStretchBltMode, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, RGBQUAD,
+            SRCCOPY, STRETCH_BLT_MODE,
         };
 
         let width = logo.width_px as usize;
@@ -382,9 +384,12 @@ mod win {
             ],
         };
 
-        let dest_h = ((height as f64) * (dest_w as f64) / (width as f64)).round() as i32;
-
         unsafe {
+            // Ronda 10b: COLORONCOLOR (3) descarta filas/columnas sin mezclar —
+            // el modo por defecto (BLACKONWHITE) hace un AND lógico al reducir
+            // un bitmap 1-bit y las líneas finas del logo desaparecían.
+            // (Firma tomada de windows-rs 0.58 — SIN compilar acá, ver LEEME.)
+            let _ = SetStretchBltMode(hdc, STRETCH_BLT_MODE(3));
             let drawn = StretchDIBits(
                 hdc,
                 x,
@@ -560,11 +565,20 @@ mod win {
                 // nunca debe bloquear la impresión (mismo criterio que
                 // térmica/red).
                 if let Some(logo) = &invoice.logo {
-                    let logo_w = content_width * 0.35; // banner discreto, no domina la hoja
-                    let logo_x = margin + (content_width - logo_w) / 2.0; // centrado
-                    match draw_logo(hdc, logo_x as i32, *y as i32, logo_w as i32, logo) {
-                        Ok(drawn_h) => *y += drawn_h as f64 + line_h * 0.5,
-                        Err(_) => { /* logo roto: se sigue sin él, no se aborta la impresión */ }
+                    // Ronda 10b: tamaño acotado por ancho (35 % del útil) Y por
+                    // alto (28 mm), con escalado entero al ampliar — ver layout.rs.
+                    let max_w = (content_width * 0.35) as i32;
+                    let max_h = (28.0 * px_y) as i32;
+                    if let Some((dw, dh)) = crate::layout::logo_dest_size(logo.width_px, logo.height_px, max_w, max_h) {
+                        // Si no cabe en lo que queda de página, se omite el logo
+                        // (nunca se dibuja cortado fuera de la hoja).
+                        if *y + dh as f64 <= page_h - margin {
+                            let logo_x = margin + (content_width - dw as f64) / 2.0; // centrado
+                            match draw_logo(hdc, logo_x as i32, *y as i32, dw, dh, logo) {
+                                Ok(drawn_h) => *y += drawn_h as f64 + line_h * 0.5,
+                                Err(_) => { /* logo roto: se sigue sin él, no se aborta la impresión */ }
+                            }
+                        }
                     }
                 }
 
@@ -722,19 +736,46 @@ mod win {
 mod win {
     use super::InvoiceDoc;
     // El agente distribuido es para Windows (el sistema operativo del 100%
-    // de los POS objetivo). En otras plataformas, estas funciones existen
-    // solo para que el proyecto compile durante desarrollo/pruebas.
+    // de los POS objetivo). En otras plataformas estas funciones existen
+    // solo para que el proyecto compile y se PRUEBE durante desarrollo/CI.
+    //
+    // Impresora falsa para pruebas: si `AGENTE_FAKE_PRINTER_DIR` apunta a una
+    // carpeta, cada trabajo se escribe ahí como archivo; si existe un archivo
+    // llamado `FAIL` en esa carpeta, el trabajo falla (simula impresora
+    // apagada). Este código NO se compila en Windows.
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    fn fake_dir() -> Option<std::path::PathBuf> {
+        std::env::var_os("AGENTE_FAKE_PRINTER_DIR").map(std::path::PathBuf::from)
+    }
+    fn fake_write(ext: &str, data: &[u8]) -> Result<(), String> {
+        let Some(dir) = fake_dir() else {
+            return Err("La impresión nativa solo está implementada para Windows.".into());
+        };
+        if dir.join("FAIL").exists() {
+            return Err("Impresora simulada apagada (FAIL).".into());
+        }
+        let n = SEQ.fetch_add(1, Ordering::SeqCst);
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        std::fs::write(dir.join(format!("job-{n:04}.{ext}")), data).map_err(|e| e.to_string())
+    }
+
     pub fn list_printers() -> Result<Vec<String>, String> {
-        Err("La impresión nativa solo está implementada para Windows.".into())
+        if fake_dir().is_some() {
+            Ok(vec!["FAKE".into()])
+        } else {
+            Err("La impresión nativa solo está implementada para Windows.".into())
+        }
     }
     pub fn default_printer() -> Option<String> {
-        None
+        fake_dir().map(|_| "FAKE".to_string())
     }
-    pub fn print_raw(_printer_name: &str, _data: &[u8]) -> Result<(), String> {
-        Err("La impresión nativa solo está implementada para Windows.".into())
+    pub fn print_raw(_printer_name: &str, data: &[u8]) -> Result<(), String> {
+        fake_write("bin", data)
     }
-    pub fn print_a4_document(_printer_name: &str, _paper_size: &str, _invoice: &InvoiceDoc) -> Result<(), String> {
-        Err("La impresión nativa solo está implementada para Windows.".into())
+    pub fn print_a4_document(_printer_name: &str, _paper_size: &str, invoice: &InvoiceDoc) -> Result<(), String> {
+        fake_write("json", serde_json::to_string(invoice).unwrap_or_default().as_bytes())
     }
 }
 

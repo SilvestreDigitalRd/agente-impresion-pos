@@ -23,16 +23,32 @@ pub struct AgentConfig {
     pub port: u16,
     pub default_printer: Option<String>,
     pub autostart: bool,
+    /// Rutas SIN prefijo `/v1` (`/print`, `/health`…) para webs viejas en
+    /// caché. Una config existente que no tiene el campo conserva `true`
+    /// (para no romper instalaciones ya emparejadas); una instalación NUEVA
+    /// nace con `false`. Se puede apagar desde la ventana del agente.
+    #[serde(default = "default_true")]
+    pub legacy_routes: bool,
 }
+
+fn default_true() -> bool {
+    true
+}
+
+/// Puerto por defecto. El 9100 es el puerto estándar de impresión RAW
+/// (JetDirect) de las impresoras de red — chocaba con servicios de
+/// impresión y con la propia impresora si el POS comparte equipo/red.
+pub const DEFAULT_PORT: u16 = 17890;
 
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             pairing_token: generate_token(),
             allowed_origin: "https://facturacion-web-nine.vercel.app".to_string(),
-            port: 9100,
+            port: DEFAULT_PORT,
             default_printer: None,
             autostart: true,
+            legacy_routes: false,
         }
     }
 }
@@ -45,12 +61,22 @@ fn generate_token() -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn config_path() -> PathBuf {
-    let mut dir = dirs::config_dir().expect("no se pudo resolver %APPDATA%");
+/// Carpeta de datos del agente (`%APPDATA%\AgenteImpresionFacturacion`).
+/// `AGENTE_DATA_DIR` la reemplaza (solo para pruebas automatizadas).
+pub fn data_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("AGENTE_DATA_DIR") {
+        let p = PathBuf::from(d);
+        fs::create_dir_all(&p).ok();
+        return p;
+    }
+    let mut dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     dir.push("AgenteImpresionFacturacion");
     fs::create_dir_all(&dir).ok();
-    dir.push("config.json");
     dir
+}
+
+fn config_path() -> PathBuf {
+    data_dir().join("config.json")
 }
 
 /// Log en disco muy simple — `eprintln!` no sirve para nada acá porque
@@ -61,10 +87,7 @@ fn config_path() -> PathBuf {
 /// puede abrir y mandar por WhatsApp si hace falta soporte remoto.
 pub fn log_line(msg: &str) {
     use std::io::Write;
-    let mut dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
-    dir.push("AgenteImpresionFacturacion");
-    fs::create_dir_all(&dir).ok();
-    dir.push("agente.log");
+    let dir = data_dir().join("agente.log");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(&dir) {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -159,6 +182,19 @@ pub fn tokens_match(provided: &str, expected: &str) -> bool {
 
 pub struct AppState {
     config: Mutex<AgentConfig>,
+    /// Carpeta de datos (cola de reintentos, gaveta.jsonl, logs).
+    pub data_dir: PathBuf,
+    /// Cola persistente de reintentos de impresión (ver queue.rs). Lock
+    /// SIEMPRE breve y nunca a través de un `.await`.
+    pub queue: Mutex<crate::queue::RetryQueue>,
+    /// Último error al abrir el puerto (None = escuchando bien). La ventana
+    /// del agente lo muestra — antes solo iba a `eprintln!`, invisible.
+    pub bind_error: Mutex<Option<String>>,
+    /// Puerto en el que el servidor está escuchando de verdad ahora (0 = ninguno).
+    pub bound_port: std::sync::atomic::AtomicU16,
+    /// Se dispara cuando cambian puerto o rutas legacy: el servidor se
+    /// reinicia solo, sin cerrar el agente.
+    pub server_reload: tokio::sync::Notify,
     // Auditoría, hallazgo B5: el actualizador nunca debe instalar a media
     // impresión — este contador (incrementado/decrementado por
     // `ActivePrintGuard`, ver más abajo) es lo que consulta
@@ -171,10 +207,32 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(config: AgentConfig) -> Self {
+        Self::new_in(config, data_dir())
+    }
+
+    pub fn new_in(config: AgentConfig, dir: PathBuf) -> Self {
+        let queue = crate::queue::RetryQueue::load(dir.join("cola_impresion.json"));
         Self {
             config: Mutex::new(config),
+            data_dir: dir,
+            queue: Mutex::new(queue),
+            bind_error: Mutex::new(None),
+            bound_port: std::sync::atomic::AtomicU16::new(0),
+            server_reload: tokio::sync::Notify::new(),
             active_prints: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    pub fn queue(&self) -> std::sync::MutexGuard<'_, crate::queue::RetryQueue> {
+        self.queue.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn set_bind_error(&self, e: Option<String>) {
+        *self.bind_error.lock().unwrap_or_else(|p| p.into_inner()) = e;
+    }
+
+    pub fn bind_error(&self) -> Option<String> {
+        self.bind_error.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 }
 

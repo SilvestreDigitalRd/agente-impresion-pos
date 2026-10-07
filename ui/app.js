@@ -14,8 +14,35 @@ async function loadStatus() {
   document.getElementById('origin').value = s.allowed_origin;
   document.getElementById('autostart').checked = s.autostart;
   document.getElementById('agentVersion').textContent = s.agent_version;
+  document.getElementById('port').value = s.port;
+  document.getElementById('legacyRoutes').checked = s.legacy_routes;
+  renderRuntimeStatus(s);
   await loadPrinters(s.default_printer);
 }
+
+// Estado vivo del servidor local: si el puerto no se pudo abrir (otro programa
+// lo usa) se muestra aquí en rojo — antes el error se perdía sin que nadie lo viera.
+function renderRuntimeStatus(s) {
+  const ps = document.getElementById('portStatus');
+  if (s.bind_error) {
+    ps.textContent = `⚠ ${s.bind_error}`;
+    ps.style.color = '#b00020';
+  } else if (s.bound_port) {
+    ps.textContent = `Escuchando en 127.0.0.1:${s.bound_port} ✔`;
+    ps.style.color = '';
+  } else {
+    ps.textContent = 'Iniciando servidor…';
+    ps.style.color = '';
+  }
+  document.getElementById('queueStatus').textContent = s.queued > 0
+    ? `⏳ ${s.queued} impresión(es) pendiente(s) de reintento (se reintentan solas).`
+    : '';
+}
+
+async function refreshRuntimeStatus() {
+  try { renderRuntimeStatus(await invoke('get_status')); } catch (_) { /* ventana cerrándose */ }
+}
+setInterval(refreshRuntimeStatus, 5000);
 
 async function loadPrinters(selected) {
   const select = document.getElementById('printerSelect');
@@ -60,15 +87,22 @@ document.getElementById('save').addEventListener('click', async () => {
   const allowed_origin = document.getElementById('origin').value.trim();
   const default_printer = document.getElementById('printerSelect').value || null;
   const autostart = document.getElementById('autostart').checked;
+  const port = parseInt(document.getElementById('port').value, 10);
+  const legacy_routes = document.getElementById('legacyRoutes').checked;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    msg.textContent = 'El puerto debe ser un número entre 1024 y 65535.';
+    return;
+  }
   try {
     // save_settings ahora devuelve Option<String>: null si todo salió bien,
     // o un aviso si autostart falló pero el resto (impresora/origen) SÍ se
     // guardó igual (antes un error de autostart perdía todo el cambio en
     // silencio — ver la nota larga en main.rs).
-    const autostartWarning = await invoke('save_settings', { allowedOrigin: allowed_origin, defaultPrinter: default_printer, autostart });
+    const autostartWarning = await invoke('save_settings', { allowedOrigin: allowed_origin, defaultPrinter: default_printer, autostart, port, legacyRoutes: legacy_routes });
     msg.textContent = autostartWarning
       ? `Guardado ✔ — impresora y origen aplicados. ${autostartWarning}`
-      : 'Guardado ✔ (si cambiaste el origen permitido, reinicia el agente para aplicarlo)';
+      : 'Guardado ✔ — los cambios (origen, puerto, rutas) ya están aplicados. Si cambiaste el puerto, actualízalo también en Configuración → Agente local del sistema web.';
+    setTimeout(refreshRuntimeStatus, 800);
   } catch (e) {
     // Antes: sin try/catch, esto quedaba como una promesa rechazada sin
     // manejar — el botón "no hacía nada" porque el error nunca llegaba a

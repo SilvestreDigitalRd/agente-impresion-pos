@@ -33,6 +33,22 @@
   </section>
 
   <section class="card">
+    <h2>Puerto local</h2>
+    <p class="muted">Puerto por el que la web habla con este agente (solo este equipo). Recomendado: 17890. Evita el 9100: es el puerto de impresión de las impresoras de red.</p>
+    <input id="port" type="number" min="1024" max="65535" />
+    <p id="portStatus" class="muted"></p>
+    <p id="queueStatus" class="muted"></p>
+  </section>
+
+  <section class="card">
+    <label class="row">
+      <input type="checkbox" id="legacyRoutes" />
+      Compatibilidad con versiones antiguas del sistema web (rutas sin /v1)
+    </label>
+    <p class="muted">Déjala desmarcada salvo que la web muestre que no encuentra el agente tras actualizar.</p>
+  </section>
+
+  <section class="card">
     <label class="row">
       <input type="checkbox" id="autostart" />
       Iniciar automáticamente con Windows
